@@ -1,0 +1,78 @@
+import { PLUGIN_ENTRY_ID } from './settings-model.js';
+/**
+ * The section id under the registered-namespace settings model (rc.7 … 0.1.6).
+ * The 0.1.7 entry-config model addresses the section by Loader entry id
+ * instead, which `settingsEntryId` reads from the live fiber.
+ */
+export declare const OPENCODE_SESSION_NAMESPACE = "dsh-thinking-effort";
+export declare const OPENCODE_SESSION_HEADER = "x-opencode-session";
+/**
+ * The Loader entry id again, re-exported for callers that already read this
+ * module. `settings-model.ts` stays its single definition: the id is both the
+ * `id:` of this plugin's row in `cordis.patch.yml` and, under the 0.1.7
+ * entry-config model, the id of the settings section that row owns.
+ */
+export { PLUGIN_ENTRY_ID };
+/**
+ * Whether a settings section id is this plugin's own. Which id that is depends
+ * on the settings model the running host exposes, and the Client cannot ask:
+ * its settings bridge answers `describe`/`mutate` only, so every host looks
+ * like the entry-config model from there. Accepting BOTH ids is what keeps a
+ * legacy host resolving `dsh-thinking-effort` while a 0.1.7 host resolves the
+ * entry id, with no model detection anywhere.
+ */
+export declare function isOpenCodeSessionSectionId(value: unknown): boolean;
+/**
+ * The generator mode list: the Host resolves stored values against it and the
+ * Client renders the mode select in this order, so both sides read one copy.
+ * Kept in this module because the Client bundle imports it and must not pull a
+ * `node:` built-in in.
+ */
+export declare const FORMAT_MODES: readonly ["ses-derive", "passthrough", "template", "expression", "script"];
+/** The timestamp-source list; same single-copy rule as `FORMAT_MODES`. */
+export declare const FORMAT_TIMES: readonly ["firstUse", "hash"];
+/** The on-invalid policy list; same single-copy rule as `FORMAT_MODES`. */
+export declare const FORMAT_INVALID_POLICIES: readonly ["warn", "drop", "send"];
+export type OpenCodeSessionFormatMode = (typeof FORMAT_MODES)[number];
+export type OpenCodeSessionTimeSource = (typeof FORMAT_TIMES)[number];
+export type OpenCodeSessionInvalidPolicy = (typeof FORMAT_INVALID_POLICIES)[number];
+/** Configurable generator shape stored under `opencodeSession.format`. */
+export interface OpenCodeSessionFormatSettings {
+    /** The generator mode; unknown values resolve to `ses-derive`. */
+    readonly mode?: OpenCodeSessionFormatMode | string;
+    /** Where the 12-hex block comes from; `firstUse` mints once per session, `hash` derives from the session digest. */
+    readonly time?: OpenCodeSessionTimeSource | string;
+    /** `template` mode: a string with `{hex12}`, `{tail62}`, `{sessionId}`, `{rawSessionId}`, `{sha256}`, `{now}`, `{provider}`, `{model}` placeholders. */
+    readonly template?: string;
+    /** `expression` mode: a safe additive expression evaluated with the same context plus `sha256`, `slice`, `lower`, `upper` functions. */
+    readonly expression?: string;
+    /** `script` mode: absolute path to a JS file exporting `format(context)`. */
+    readonly script?: string;
+    /** Optional validation regex; invalid values follow `onInvalid`. */
+    readonly validate?: string;
+    /** What to do when the produced value fails `validate`: `warn`, `drop`, or `send`. */
+    readonly onInvalid?: OpenCodeSessionInvalidPolicy | string;
+}
+/** Configurable `user-agent` override, scoped per provider/model. */
+export interface OpenCodeSessionUserAgentSettings {
+    /** Master value. Empty or absent disables the override entirely. */
+    readonly value?: string;
+    readonly providers?: Readonly<Record<string, {
+        /** Apply the override to every model on this route. */
+        readonly enabled?: boolean;
+        /** Optional per-route value; falls back to the master `value`. */
+        readonly value?: string;
+        readonly models?: Readonly<Record<string, boolean>>;
+    }>>;
+}
+export interface OpenCodeSessionSettings {
+    readonly opencodeSession?: {
+        readonly providers?: Readonly<Record<string, {
+            readonly models?: Readonly<Record<string, boolean>>;
+        }>>;
+        readonly format?: OpenCodeSessionFormatSettings;
+        readonly userAgent?: OpenCodeSessionUserAgentSettings;
+    };
+}
+export declare function isOpenCodeSessionEnabled(settings: unknown, provider: string, model: string): boolean;
+export declare function modelPath(provider: string, model: string): readonly string[] | undefined;

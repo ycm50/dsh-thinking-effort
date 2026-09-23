@@ -1,0 +1,2111 @@
+// @vitest-environment jsdom
+import React, { act } from 'react'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+import { createRoot, type Root } from 'react-dom/client'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { SectionEditor } from '../src/client/SectionEditor.js'
+import { createTakeoverRuntimeStore, type TakeoverRuntimeResolution } from '../src/client/takeover-runtime.js'
+import { resolveGatewayCompat } from '../src/compat/gateway/resolve.js'
+import { GatewayCompatControls, renderGatewayCompatControls } from '../src/client/components/GatewayCompatControls.js'
+import { ModelEditor } from '../src/client/components/ModelEditor.js'
+import { ConfigBackupCard } from '../src/client/components/ConfigBackupCard.js'
+import { inventoryFrom, modelGatewayCompatViewFrom, providerGatewayCompatViewFrom } from '../src/client/model-inventory.js'
+import { en, ja, ko, zh } from '../src/client/locales.js'
+import { isOpenCodeSessionNamespace, openCodeSessionKey, openCodeSessionView } from '../src/client/model-header-ops.js'
+import { applyOpenCodeSessionMutation, createOpenCodeSessionState, saveOpenCodeSession, type OpenCodeSessionState } from '../src/client/SectionEditor.js'
+import { modelView, providerView } from './gateway-compat-test-helpers.js'
+import { iosPalette } from '../src/client/theme.js'
+import type {
+  ClientLocale,
+  ClientResult,
+  InventoryItem,
+  SettingsApi,
+  SettingsNamespace,
+  SettingsOp,
+  Translation,
+} from '../src/client/types.js'
+
+const packageManifest = JSON.parse(readFileSync(resolve(import.meta.dirname, '..', 'package.json'), 'utf8')) as { version: string }
+
+const text = (key: string, params?: Record<string, unknown>): string => {
+  const value = (zh as Record<string, string>)[key] ?? key
+  return value.replace(/\{(\w+)\}/g, (_match: string, name: string) => String(params?.[name] ?? `{${name}}`))
+}
+
+const realGatewaySchema = {
+  uid: 6,
+  refs: {
+    '0': { type: 'boolean', meta: {} },
+    '1': { type: 'string', meta: {} },
+    '2': { type: 'object', meta: { default: {} }, dict: {
+      supportsStore: 0,
+      supportsDeveloperRole: 0,
+      supportsReasoningEffort: 0,
+      supportsUsageInStreaming: 0,
+      supportsFinishReason: 0,
+      requiresToolResultName: 0,
+      requiresAssistantAfterToolResult: 0,
+      requiresThinkingAsText: 0,
+      requiresReasoningContentOnAssistantMessages: 0,
+      supportsThinkingTokenBudget: 0,
+      supportsStrictMode: 0,
+      supportsLongCacheRetention: 0,
+      maxTokensField: 1,
+      thinkingFormat: 1,
+      cacheControlFormat: 1,
+    } },
+    '3': { type: 'object', meta: { default: {} }, dict: { compat: 2 } },
+    '4': { type: 'dict', meta: { default: {} }, inner: 3, sKey: 5 },
+    '5': { type: 'string', meta: {} },
+    '6': { type: 'object', meta: { default: {} }, dict: { providers: 4 } },
+  },
+} as const
+
+;(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
+
+const namespace = (overrides: Partial<SettingsNamespace> = {}): SettingsNamespace => ({
+  ns: 'llm-pi-ai',
+  revision: 2,
+  value: {
+    providers: {
+      provider: {
+        models: [
+          {
+            id: 'model-a',
+            name: 'Model A',
+            reasoningEfforts: { off: null },
+            input: ['text'],
+            contextWindow: 8192,
+          },
+          {
+            id: 'model-b',
+            reasoningEfforts: { off: null, high: 'high' },
+            input: ['text', 'image'],
+          },
+        ],
+        modelOverrides: {
+          'override-a': {
+            name: 'Override A',
+            reasoningEfforts: { off: null, low: 'low' },
+            input: ['image'],
+          },
+        },
+      },
+    },
+  },
+  user: { subagentEffort: 'high' },
+  ...overrides,
+})
+
+/**
+ * The plugin's own section under the 0.1.7 entry-config model: the Loader entry
+ * id names it, and every plugin setting — including `subagentEffort` — lives in
+ * it rather than in the `llm-pi-ai` section.
+ */
+const entryConfigNamespace = (overrides: Partial<SettingsNamespace> = {}): SettingsNamespace => ({
+  ns: 'thinking-effort',
+  revision: 9,
+  value: {
+    opencodeSession: { providers: { provider: { models: { 'model-a': true } } } },
+    subagentEffort: 'medium',
+    profiles: {},
+    autoBackup: { kind: 'dsh-thinking-effort/config-snapshot', version: 1, createdAt: '', pluginVersion: '', sourceProfile: 'unknown', sections: {} },
+  },
+  user: { subagentEffort: 'medium' },
+  ...overrides,
+})
+
+const openCodeNamespace = (overrides: Partial<SettingsNamespace> = {}): SettingsNamespace => ({
+  ns: 'dsh-thinking-effort',
+  revision: 17,
+  value: {
+    opencodeSession: {
+      providers: {
+        provider: { models: { 'model-a': true } },
+      },
+    },
+  },
+  ...overrides,
+})
+
+const modelItem = (source: SettingsNamespace = namespace()): InventoryItem => {
+  const item = inventoryFrom(source).find((candidate) => candidate.route === 'provider' && candidate.model === 'model-a')
+  if (item === undefined) throw new Error('missing provider/model-a fixture')
+  return { ...item, modelSourceConflict: false }
+}
+
+const openCodeLlmNamespace = (overrides: Partial<SettingsNamespace> = {}): SettingsNamespace => namespace({
+  value: {
+    providers: {
+      provider: {
+        models: [
+          {
+            id: 'model-a',
+            name: 'Model A',
+            reasoningEfforts: { off: null },
+            input: ['text'],
+            contextWindow: 8192,
+          },
+          {
+            id: 'model-b',
+            name: 'Model B',
+            reasoningEfforts: { off: null, high: 'high' },
+            input: ['text', 'image'],
+          },
+        ],
+      },
+    },
+  },
+  ...overrides,
+})
+
+function localeSnapshot(locales: readonly string[] = ['zh', 'en', 'ja']): ClientLocale {
+  return {
+    register: () => () => undefined,
+    bind: () => text,
+    getSnapshot: () => ({ active: 'zh', locales: locales.map((id) => ({ id })) }),
+    setLocale: vi.fn(),
+  }
+}
+
+function renderEditor(options: {
+  describe?: () => Promise<ClientResult<{ namespaces: readonly SettingsNamespace[] }>>
+  mutate?: (ns: string, ops: readonly SettingsOp[], revision: number) => Promise<ClientResult<SettingsNamespace>>
+  baseNamespace?: SettingsNamespace
+  namespaces?: readonly SettingsNamespace[]
+  locales?: readonly string[]
+  compatibilityProfile?: 'modern' | 'legacy' | 'unknown'
+  takeoverResolution?: TakeoverRuntimeResolution
+} = {}): {
+  container: HTMLDivElement
+  root: Root
+  locale: ClientLocale
+  mutate: ReturnType<typeof vi.fn>
+  unmount: () => void
+} {
+  const container = document.createElement('div')
+  document.body.append(container)
+  const locale = localeSnapshot(options.locales)
+  const mutate = vi.fn<SettingsApi['mutate']>(options.mutate ?? (async (ns, _ops, _revision) => ({ ok: true as const, value: ns === 'dsh-thinking-effort' ? openCodeNamespace() : namespace() })))
+  const settings: SettingsApi = {
+    externalLanguages: false,
+    compatibilityProfile: options.compatibilityProfile ?? 'unknown',
+    describe: options.describe ?? (async () => ({ ok: true, value: { namespaces: [options.baseNamespace ?? namespace(), ...(options.namespaces ?? [])] } })),
+    mutate,
+  }
+  const root = createRoot(container)
+  const takeoverRuntime = options.takeoverResolution === undefined ? undefined : createTakeoverRuntimeStore()
+  takeoverRuntime?.update(options.takeoverResolution!)
+  act(() => {
+    root.render(<SectionEditor settings={settings} locale={locale} t={text as Translation} takeoverRuntime={takeoverRuntime} />)
+  })
+  return {
+    container,
+    root,
+    locale,
+    mutate,
+    unmount: () => {
+      act(() => root.unmount())
+      container.remove()
+    },
+  }
+}
+
+async function settle(): Promise<void> {
+  await act(async () => {
+    await Promise.resolve()
+    await Promise.resolve()
+  })
+}
+
+function button(container: HTMLElement, label: string): HTMLButtonElement {
+  const found = [...container.querySelectorAll('button')].find((candidate) => candidate.getAttribute('aria-label') === label || candidate.textContent?.includes(label))
+  expect(found).not.toBeUndefined()
+  return found as HTMLButtonElement
+}
+
+function setValue(element: HTMLInputElement | HTMLSelectElement, value: string): void {
+  const prototype = element instanceof HTMLSelectElement ? HTMLSelectElement.prototype : HTMLInputElement.prototype
+  const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set
+  setter?.call(element, value)
+  element.dispatchEvent(new Event(element instanceof HTMLSelectElement ? 'change' : 'input', { bubbles: true }))
+}
+
+function allSwitches(container: HTMLElement): HTMLButtonElement[] {
+  return [...container.querySelectorAll('button[role="switch"]')] as HTMLButtonElement[]
+}
+
+function modelSettingsButton(container: HTMLElement): HTMLButtonElement {
+  return button(container, text('openModelSettings'))
+}
+
+function providerButton(container: HTMLElement): HTMLButtonElement {
+  return button(container, text('expandProvider'))
+}
+
+function openFirstModel(container: HTMLElement): void {
+  act(() => providerButton(container).click())
+  act(() => modelSettingsButton(container).click())
+}
+
+afterEach(() => {
+  document.body.replaceChildren()
+})
+
+describe('OpenCode session Client namespace state', () => {
+  it('reads an exact provider/model view without inheriting sibling settings', () => {
+    const item = modelItem()
+    const plugin = openCodeNamespace()
+
+    expect(isOpenCodeSessionNamespace(plugin)).toBe(true)
+    expect(openCodeSessionKey(item)).toBe(JSON.stringify(['provider', 'model-a']))
+    expect(openCodeSessionView(plugin, item)).toBe(true)
+    expect(openCodeSessionView(plugin, { ...item, model: 'model-b' })).toBe(false)
+    expect(openCodeSessionView(plugin, { ...item, route: 'other-provider' })).toBe(false)
+  })
+
+  it('marks missing or malformed plugin namespaces unavailable without changing the model UI source', async () => {
+    const item = modelItem()
+    const missing = createOpenCodeSessionState(undefined, [item])
+    const malformed = createOpenCodeSessionState({
+      ...openCodeNamespace(),
+      revision: undefined as never,
+      value: [] as never,
+    }, [item])
+
+    expect(missing).toMatchObject({ found: false, available: false, namespace: null, views: {}, drafts: {}, dirty: {} })
+    expect(malformed).toMatchObject({ found: true, available: false, namespace: null, views: {}, drafts: {}, dirty: {} })
+
+    const view = renderEditor()
+    await settle()
+    expect(view.container.textContent).toContain(text('pageTitle'))
+    openFirstModel(view.container)
+    expect(view.container.textContent).toContain(text('reasoningLevels'))
+    view.unmount()
+  })
+
+  it('keeps the plugin revision independent and retains a dirty draft after a failed save', () => {
+    const item = modelItem()
+    const key = openCodeSessionKey(item)
+    const initial = createOpenCodeSessionState(openCodeNamespace(), [item])
+    const dirty: OpenCodeSessionState = {
+      ...initial,
+      drafts: { [key]: false },
+      dirty: { [key]: true },
+    }
+    const failed = applyOpenCodeSessionMutation(dirty, {
+      ok: false,
+      error: { message: 'stale revision' },
+    }, [item], key)
+
+    expect(failed).toBe(dirty)
+    expect(failed.namespace?.revision).toBe(17)
+    expect(failed.drafts[key]).toBe(false)
+    expect(failed.dirty[key]).toBe(true)
+  })
+
+  it('uses the plugin namespace revision and preserves a failed mutate result', async () => {
+    const item = modelItem()
+    const mutate = vi.fn<SettingsApi['mutate']>(async (ns, ops, revision) => {
+      expect(ns).toBe('dsh-thinking-effort')
+      expect(ops).toEqual([{
+        op: 'set',
+        path: ['opencodeSession', 'providers', 'provider', 'models', 'model-a'],
+        value: true,
+      }])
+      expect(revision).toBe(17)
+      return { ok: false as const, error: { message: 'stale revision' } }
+    })
+
+    await expect(saveOpenCodeSession({ mutate }, openCodeNamespace(), item, true)).resolves.toEqual({
+      ok: false,
+      error: { message: 'stale revision' },
+    })
+    expect(mutate).toHaveBeenCalledTimes(1)
+  })
+
+  it('refreshes a clean draft and only the saved key after a successful plugin mutation', () => {
+    const item = modelItem()
+    const other = { ...item, model: 'model-b' }
+    const key = openCodeSessionKey(item)
+    const otherKey = openCodeSessionKey(other)
+    const initial = createOpenCodeSessionState(openCodeNamespace(), [item, other])
+    const dirty: OpenCodeSessionState = {
+      ...initial,
+      drafts: { [key]: false, [otherKey]: true },
+      dirty: { [key]: true, [otherKey]: true },
+    }
+    const saved = openCodeNamespace({
+      revision: 18,
+      value: {
+        opencodeSession: {
+          providers: {
+            provider: { models: { 'model-a': false, 'model-b': true } },
+          },
+        },
+      },
+    })
+    const refreshed = applyOpenCodeSessionMutation(dirty, { ok: true, value: saved }, [item, other], key)
+
+    expect(refreshed.namespace?.revision).toBe(18)
+    expect(refreshed.views[key]).toBe(false)
+    expect(refreshed.drafts[key]).toBe(false)
+    expect(refreshed.dirty[key]).toBeUndefined()
+    expect(refreshed.drafts[otherKey]).toBe(true)
+    expect(refreshed.dirty[otherKey]).toBe(true)
+  })
+
+  it('preserves a dirty draft when the plugin mutation returns an invalid namespace descriptor', () => {
+    const item = modelItem()
+    const key = openCodeSessionKey(item)
+    const initial = createOpenCodeSessionState(openCodeNamespace(), [item])
+    const dirty: OpenCodeSessionState = {
+      ...initial,
+      drafts: { [key]: false },
+      dirty: { [key]: true },
+    }
+    const invalid = openCodeNamespace({
+      ns: 'llm-pi-ai',
+      revision: 18,
+      value: { opencodeSession: { providers: { provider: { models: { 'model-a': 'yes' } } } } },
+    })
+    const refreshed = applyOpenCodeSessionMutation(dirty, { ok: true, value: invalid }, [item], key)
+
+    expect(refreshed).toBe(dirty)
+    expect(refreshed.drafts[key]).toBe(false)
+    expect(refreshed.dirty[key]).toBe(true)
+    expect(refreshed.namespace?.revision).toBe(17)
+  })
+
+  it('reports missing namespace when SectionEditor receives an invalid OpenCode mutation response', async () => {
+    const llm = openCodeLlmNamespace({ schema: realGatewaySchema })
+    const plugin = openCodeNamespace({
+      value: { opencodeSession: { providers: { provider: { models: { 'model-a': false } } } } },
+    })
+    const mutate = vi.fn<SettingsApi['mutate']>(async () => ({
+      ok: true as const,
+      value: openCodeNamespace({
+        ns: 'llm-pi-ai',
+        value: { opencodeSession: { providers: { provider: { models: { 'model-a': 'invalid' } } } } },
+      }) as never,
+    }))
+    const view = renderEditor({
+      describe: async () => ({ ok: true, value: { namespaces: [llm, plugin] } }),
+      mutate,
+      compatibilityProfile: 'modern',
+    })
+    await settle()
+    openFirstModel(view.container)
+    const headerSwitch = view.container.querySelector(`[data-scope="opencode-session"] button[role="switch"][aria-label="${text('opencodeSessionHeaderTitle')}"]`) as HTMLButtonElement
+    act(() => headerSwitch.click())
+    await settle()
+
+    expect(view.container.querySelector('[role="alert"]')?.textContent).toContain(text('saveMissingNamespace'))
+    expect(mutate).toHaveBeenCalledWith('dsh-thinking-effort', expect.any(Array), plugin.revision)
+    view.unmount()
+  })
+
+  it('saves through SectionEditor with both namespaces and refreshes plugin state without changing llm state', async () => {
+    const llm = openCodeLlmNamespace({
+      schema: realGatewaySchema,
+      user: { providers: { provider: { compat: { supportsDeveloperRole: false } } } },
+    })
+    const plugin = openCodeNamespace({
+      value: { opencodeSession: { providers: { provider: { models: { 'model-a': false } } } } },
+    })
+    const savedPlugin = openCodeNamespace({
+      revision: 18,
+      value: { opencodeSession: { providers: { provider: { models: { 'model-a': true } } } } },
+    })
+    const mutate = vi.fn<SettingsApi['mutate']>(async (ns, ops, revision) => {
+      expect(ns).toBe('dsh-thinking-effort')
+      expect(ops).toEqual([{
+        op: 'set',
+        path: ['opencodeSession', 'providers', 'provider', 'models', 'model-a'],
+        value: true,
+      }])
+      expect(revision).toBe(plugin.revision)
+      return { ok: true as const, value: savedPlugin }
+    })
+    const view = renderEditor({
+      namespaces: [plugin],
+      describe: async () => ({ ok: true, value: { namespaces: [llm, plugin] } }),
+      mutate,
+      compatibilityProfile: 'modern',
+    })
+    await settle()
+
+    expect(view.container.textContent).toContain(text('pageTitle'))
+    openFirstModel(view.container)
+    const beforeSupportsDeveloperRole = view.container.querySelector(
+      `[data-scope="provider"] select[aria-label="${text('supportsDeveloperRole')}"]`,
+    ) as HTMLSelectElement
+    expect(beforeSupportsDeveloperRole).not.toBeNull()
+    expect(beforeSupportsDeveloperRole.value).toBe('unsupported')
+    const headerSwitch = view.container.querySelector(`[data-scope="opencode-session"] button[role="switch"][aria-label="${text('opencodeSessionHeaderTitle')}"]`) as HTMLButtonElement
+    expect(headerSwitch).not.toBeNull()
+    act(() => headerSwitch.click())
+    await settle()
+
+    expect(mutate).toHaveBeenCalledWith('dsh-thinking-effort', [{
+      op: 'set',
+      path: ['opencodeSession', 'providers', 'provider', 'models', 'model-a'],
+      value: true,
+    }], plugin.revision)
+    expect(view.container.textContent).toContain(text('opencodeSessionSaved'))
+    expect(view.container.querySelector('[title="' + text('unsaved') + '"]')).toBeNull()
+    const afterSupportsDeveloperRole = view.container.querySelector(
+      `[data-scope="provider"] select[aria-label="${text('supportsDeveloperRole')}"]`,
+    ) as HTMLSelectElement
+    expect(afterSupportsDeveloperRole).not.toBeNull()
+    expect(afterSupportsDeveloperRole.value).toBe(beforeSupportsDeveloperRole.value)
+    expect(view.container.querySelector('[data-scope="provider"]')).not.toBeNull()
+    view.unmount()
+  })
+
+  it('saves the OpenCode session toggle immediately without a separate save button', async () => {
+    const llm = openCodeLlmNamespace({
+      schema: realGatewaySchema,
+      user: { providers: { provider: { compat: { supportsDeveloperRole: false } } } },
+    })
+    const plugin = openCodeNamespace({
+      value: { opencodeSession: { providers: { provider: { models: { 'model-a': false } } } } },
+    })
+    const savedPlugin = openCodeNamespace({
+      revision: 18,
+      value: { opencodeSession: { providers: { provider: { models: { 'model-a': true } } } } },
+    })
+    const mutate = vi.fn<SettingsApi['mutate']>(async (ns, ops, revision) => {
+      expect(ns).toBe('dsh-thinking-effort')
+      expect(ops).toEqual([{
+        op: 'set',
+        path: ['opencodeSession', 'providers', 'provider', 'models', 'model-a'],
+        value: true,
+      }])
+      expect(revision).toBe(plugin.revision)
+      return { ok: true as const, value: savedPlugin }
+    })
+    const view = renderEditor({
+      namespaces: [plugin],
+      describe: async () => ({ ok: true, value: { namespaces: [llm, plugin] } }),
+      mutate,
+      compatibilityProfile: 'modern',
+    })
+    await settle()
+
+    openFirstModel(view.container)
+    const headerSwitch = view.container.querySelector(`[data-scope="opencode-session"] button[role="switch"][aria-label="${text('opencodeSessionHeaderTitle')}"]`) as HTMLButtonElement
+    expect(headerSwitch).not.toBeNull()
+    act(() => headerSwitch.click())
+    await settle()
+
+    expect(mutate).toHaveBeenCalledWith('dsh-thinking-effort', [{
+      op: 'set',
+      path: ['opencodeSession', 'providers', 'provider', 'models', 'model-a'],
+      value: true,
+    }], plugin.revision)
+    expect(view.container.textContent).toContain(text('opencodeSessionSaved'))
+    expect(view.container.querySelector(`[data-scope="opencode-session"] button[aria-label="${text('saveOpenCodeSessionAria')}"]`)).toBeNull()
+    expect(view.container.querySelector('[title="' + text('unsaved') + '"]')).toBeNull()
+    view.unmount()
+  })
+
+  it('writes the entry-id section a 0.1.7 host publishes instead of the legacy namespace', async () => {
+    const llm = openCodeLlmNamespace()
+    // The 0.1.7 entry-config model publishes one section per Loader entry and
+    // no legacy namespace at all, so the switch has to resolve that section or
+    // the whole OpenCode surface reads as unavailable.
+    const entry = entryConfigNamespace({
+      revision: 21,
+      value: { opencodeSession: { providers: { provider: { models: { 'model-a': false } } } } },
+    })
+    const savedEntry = entryConfigNamespace({
+      revision: 22,
+      value: { opencodeSession: { providers: { provider: { models: { 'model-a': true } } } } },
+    })
+    const mutate = vi.fn<SettingsApi['mutate']>(async (ns, ops, revision) => {
+      expect(ns).toBe('thinking-effort')
+      expect(ops).toEqual([{
+        op: 'set',
+        path: ['opencodeSession', 'providers', 'provider', 'models', 'model-a'],
+        value: true,
+      }])
+      expect(revision).toBe(entry.revision)
+      return { ok: true as const, value: savedEntry }
+    })
+    const view = renderEditor({
+      namespaces: [entry],
+      describe: async () => ({ ok: true, value: { namespaces: [llm, entry] } }),
+      mutate,
+      compatibilityProfile: 'modern',
+    })
+    await settle()
+
+    openFirstModel(view.container)
+    const headerSwitch = view.container.querySelector(`[data-scope="opencode-session"] button[role="switch"][aria-label="${text('opencodeSessionHeaderTitle')}"]`) as HTMLButtonElement
+    expect(headerSwitch).not.toBeNull()
+    act(() => headerSwitch.click())
+    await settle()
+
+    expect(mutate).toHaveBeenCalledTimes(1)
+    expect(view.container.textContent).toContain(text('opencodeSessionSaved'))
+    view.unmount()
+  })
+
+  it('renders the OpenCode transport setting only inside the model editor and toggles it immediately', () => {
+    const item = modelItem()
+    const onSave = vi.fn()
+    const onOpenCodeSessionChange = vi.fn()
+    const container = document.createElement('div')
+    document.body.append(container)
+    const root = createRoot(container)
+    act(() => {
+      root.render(<ModelEditor item={item} draft={{ off: { on: true, wire: '' } }} contextDraft={{ value: '', oneMillion: false, previousValue: '', touched: false }} inputDraft={{ text: true, image: false, touched: false }} dirty={false} busy={false} palette={iosPalette()} t={text as Translation} onLevelChange={vi.fn()} onContextChange={vi.fn()} onOneMillionChange={vi.fn()} onInputChange={vi.fn()} onSave={onSave} onRestoreReasoning={vi.fn()} onRestoreCapability={vi.fn()} openCodeSession={false} openCodeSessionAvailable onOpenCodeSessionChange={onOpenCodeSessionChange} />)
+    })
+
+    const modelScope = container
+    const transport = modelScope.querySelector('[data-scope="opencode-session"]') as HTMLElement
+    expect(transport).not.toBeNull()
+    expect(container.querySelector('[data-scope="provider"]')).toBeNull()
+    expect(transport.textContent).toContain(text('opencodeSessionHeaderTitle'))
+    expect(transport.textContent).toContain(text('opencodeSessionHeaderDescription'))
+    expect(transport.querySelector(`button[aria-label="${text('saveOpenCodeSessionAria')}"]`)).toBeNull()
+
+    const headerSwitch = transport.querySelector('button[role="switch"]') as HTMLButtonElement
+    expect(headerSwitch.getAttribute('aria-label')).toBe(text('opencodeSessionHeaderTitle'))
+    act(() => headerSwitch.click())
+    expect(onOpenCodeSessionChange).toHaveBeenCalledWith(true)
+    expect(onSave).not.toHaveBeenCalled()
+    act(() => root.unmount())
+    container.remove()
+  })
+
+  it('hides unavailable transport settings and disables non-editable transport controls', () => {
+    const item = modelItem()
+    const render = (available: boolean, onChange?: (enabled: boolean) => void): { container: HTMLDivElement; root: Root } => {
+      const container = document.createElement('div')
+      document.body.append(container)
+      const root = createRoot(container)
+      act(() => {
+        root.render(<ModelEditor item={item} draft={{ off: { on: true, wire: '' } }} contextDraft={{ value: '', oneMillion: false, previousValue: '', touched: false }} inputDraft={{ text: true, image: false, touched: false }} dirty={false} busy={false} palette={iosPalette()} t={text as Translation} onLevelChange={vi.fn()} onContextChange={vi.fn()} onOneMillionChange={vi.fn()} onInputChange={vi.fn()} onSave={vi.fn()} onRestoreReasoning={vi.fn()} onRestoreCapability={vi.fn()} openCodeSession={false} openCodeSessionAvailable={available} onOpenCodeSessionChange={onChange} />)
+      })
+      return { container, root }
+    }
+
+    const unavailable = render(false)
+    expect(unavailable.container.querySelector('[data-scope="opencode-session"]')).toBeNull()
+    act(() => unavailable.root.unmount())
+    unavailable.container.remove()
+
+    const nonEditable = render(true)
+    const headerSwitch = nonEditable.container.querySelector('[data-scope="opencode-session"] button[role="switch"]') as HTMLButtonElement
+    expect(headerSwitch.disabled).toBe(true)
+    act(() => nonEditable.root.unmount())
+    nonEditable.container.remove()
+  })
+
+  it('hides the transport setting for conflicting model sources', () => {
+    const item = { ...modelItem(), modelSourceConflict: true }
+    const container = document.createElement('div')
+    document.body.append(container)
+    const root = createRoot(container)
+    act(() => {
+      root.render(<ModelEditor item={item} draft={{ off: { on: true, wire: '' } }} contextDraft={{ value: '', oneMillion: false, previousValue: '', touched: false }} inputDraft={{ text: true, image: false, touched: false }} dirty={false} busy={false} palette={iosPalette()} t={text as Translation} onLevelChange={vi.fn()} onContextChange={vi.fn()} onOneMillionChange={vi.fn()} onInputChange={vi.fn()} onSave={vi.fn()} onRestoreReasoning={vi.fn()} onRestoreCapability={vi.fn()} openCodeSession={false} openCodeSessionAvailable onOpenCodeSessionChange={vi.fn()} />)
+    })
+
+    expect(container.querySelector('[data-scope="opencode-session"]')).toBeNull()
+    expect(container.textContent).toContain(text('reasoningLevels'))
+    act(() => root.unmount())
+    container.remove()
+  })
+
+  it('isolates Header drafts by exact provider and model in the rendered editor', async () => {
+    const plugin = openCodeNamespace({
+      value: { opencodeSession: { providers: { provider: { models: { 'model-a': true, 'model-b': false } } } } },
+    })
+    const view = renderEditor({ baseNamespace: openCodeLlmNamespace(), namespaces: [plugin] })
+    await settle()
+    act(() => providerButton(view.container).click())
+
+    const modelButtons = [...view.container.querySelectorAll<HTMLButtonElement>(`button[aria-label="${text('openModelSettings')}"]`)]
+    const modelAButton = modelButtons.find((candidate) => candidate.parentElement?.parentElement?.parentElement?.textContent?.includes('model-a'))
+    const modelBButton = modelButtons.find((candidate) => candidate.parentElement?.parentElement?.parentElement?.textContent?.includes('model-b'))
+    expect(modelAButton).toBeDefined()
+    expect(modelBButton).toBeDefined()
+    act(() => modelAButton!.click())
+    const modelA = [...view.container.querySelectorAll('[data-scope="opencode-session"]')][0] as HTMLElement
+    expect((modelA.querySelector('button[role="switch"]') as HTMLButtonElement).getAttribute('aria-checked')).toBe('true')
+
+    act(() => modelBButton!.click())
+    const modelControls = [...view.container.querySelectorAll('[data-scope="opencode-session"]')]
+    expect(modelControls).toHaveLength(2)
+    expect((modelControls[1]!.querySelector('button[role="switch"]') as HTMLButtonElement).getAttribute('aria-checked')).toBe('false')
+    view.unmount()
+  })
+
+  it('saves the Header toggle immediately and keeps the value across collapsing', async () => {
+    const plugin = openCodeNamespace({
+      value: { opencodeSession: { providers: { provider: { models: { 'model-a': false } } } } },
+    })
+    const view = renderEditor({
+      baseNamespace: openCodeLlmNamespace(),
+      namespaces: [plugin],
+      mutate: async (ns, ops, revision) => {
+        expect(ns).toBe('dsh-thinking-effort')
+        expect(ops).toEqual([{
+          op: 'set',
+          path: ['opencodeSession', 'providers', 'provider', 'models', 'model-a'],
+          value: true,
+        }])
+        return { ok: true as const, value: openCodeNamespace({ revision: (revision as number) + 1, value: { opencodeSession: { providers: { provider: { models: { 'model-a': true } } } } } }) }
+      },
+    })
+    await settle()
+    openFirstModel(view.container)
+
+    const transport = view.container.querySelector('[data-scope="opencode-session"]') as HTMLElement
+    const headerSwitch = transport.querySelector('button[role="switch"]') as HTMLButtonElement
+    act(() => headerSwitch.click())
+    await settle()
+    expect(headerSwitch.getAttribute('aria-checked')).toBe('true')
+    expect(view.container.querySelector('[title="' + text('unsaved') + '"]')).toBeNull()
+
+    act(() => button(view.container, text('closeModelSettings')).click())
+    expect(view.container.querySelector('[data-scope="opencode-session"]')).toBeNull()
+    expect(view.container.querySelector('[title="' + text('unsaved') + '"]')).toBeNull()
+
+    act(() => modelSettingsButton(view.container).click())
+    const reopenedTransport = view.container.querySelector('[data-scope="opencode-session"]') as HTMLElement
+    const reopenedSwitch = reopenedTransport.querySelector('button[role="switch"]') as HTMLButtonElement
+    expect(reopenedSwitch.getAttribute('aria-checked')).toBe('true')
+    expect(reopenedTransport.querySelector(`button[aria-label="${text('saveOpenCodeSessionAria')}"]`)).toBeNull()
+    view.unmount()
+  })
+
+  it('reports a failed toggle save and keeps the switch value', async () => {
+    const plugin = openCodeNamespace({
+      value: { opencodeSession: { providers: { provider: { models: { 'model-a': false } } } } },
+    })
+    const view = renderEditor({
+      baseNamespace: openCodeLlmNamespace(),
+      namespaces: [plugin],
+      mutate: async () => ({ ok: false as const, error: { message: 'conflict' } }),
+    })
+    await settle()
+    openFirstModel(view.container)
+
+    const transport = view.container.querySelector('[data-scope="opencode-session"]') as HTMLElement
+    const headerSwitch = transport.querySelector('button[role="switch"]') as HTMLButtonElement
+    act(() => headerSwitch.click())
+    await settle()
+
+    expect(view.container.querySelector('[role="alert"]')?.textContent).toContain('conflict')
+    expect(headerSwitch.getAttribute('aria-checked')).toBe('true')
+    expect(transport.querySelector(`button[aria-label="${text('saveOpenCodeSessionAria')}"]`)).toBeNull()
+    view.unmount()
+  })
+
+  it('provides OpenCode-specific copy for every supported locale without GPT or generic gateway wording', () => {
+    const locales: readonly [string, Record<string, string>][] = [['en', en], ['zh', zh], ['ja', ja], ['ko', ko]]
+    const keys = ['opencodeSessionHeaderTitle', 'opencodeSessionHeaderDescription', 'opencodeSessionSaved', 'opencodeSessionSaveFailed']
+    for (const [locale, dictionary] of locales) {
+      for (const key of keys) {
+        expect(dictionary[key], `${locale} missing ${key}`).toBeTruthy()
+        expect(dictionary[key], `${locale} fell back to ${key}`).not.toBe(key)
+      }
+      expect(dictionary.opencodeSessionHeaderDescription).toContain('x-opencode-session')
+      expect(dictionary.opencodeSessionHeaderDescription.toLowerCase()).not.toContain('gpt')
+      expect(dictionary.opencodeSessionHeaderDescription.toLowerCase()).not.toContain('gateway compatibility')
+    }
+  })
+})
+
+describe('SectionEditor user behavior', () => {
+  it('renders provider gateway compatibility controls and emits only a view change', () => {
+    const view = providerView({
+      provider: 'provider',
+      supportsDeveloperRole: 'auto' as const,
+      maxTokensField: 'max_tokens' as const,
+      supportsDeveloperRoleAvailable: true,
+      maxTokensFieldAvailable: true,
+      supportsDeveloperRoleSource: 'unknown' as const,
+      maxTokensFieldSource: 'unknown' as const,
+      source: 'unknown' as const,
+    })
+    const onChange = vi.fn()
+    const container = document.createElement('div')
+    document.body.append(container)
+    const root = createRoot(container)
+    act(() => {
+      root.render(<GatewayCompatControls view={view} onChange={onChange} availableCount={0} />)
+    })
+
+    expect(container.textContent).toContain('Gateway compatibility')
+    expect(container.textContent).toContain('Auto')
+    const selects = [...container.querySelectorAll('select')] as HTMLSelectElement[]
+    expect(selects).toHaveLength(2)
+    expect(selects[0]?.value).toBe('auto')
+    expect(selects[1]?.value).toBe('max_tokens')
+    act(() => setValue(selects[0]!, 'unsupported'))
+    expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ supportsDeveloperRole: 'unsupported' }))
+    act(() => root.unmount())
+    container.remove()
+  })
+
+  it('renders model compat controls with field sources and Auto inheritance', () => {
+    const view = modelView({
+      provider: 'provider',
+      model: 'model-b',
+      supportsDeveloperRole: 'auto' as const,
+      maxTokensField: 'max_tokens' as const,
+      supportsDeveloperRoleSource: 'provider' as const,
+      maxTokensFieldSource: 'model' as const,
+      supportsDeveloperRoleAvailable: true,
+      maxTokensFieldAvailable: true,
+    })
+    const onChange = vi.fn()
+    const container = document.createElement('div')
+    document.body.append(container)
+    const root = createRoot(container)
+    act(() => {
+      root.render(<GatewayCompatControls scope="model" view={view} onChange={onChange} availableCount={0} />)
+    })
+
+    expect(container.textContent).toContain('model-b')
+    expect(container.textContent).toContain(en.compatSourceProvider)
+    expect(container.textContent).toContain(en.compatSourceModel)
+    const selects = [...container.querySelectorAll('select')] as HTMLSelectElement[]
+    expect(selects).toHaveLength(2)
+    expect([...selects[0]!.options].map((option) => option.value)).toContain('auto')
+    expect([...selects[1]!.options].map((option) => option.value)).toContain('auto')
+    expect(container.textContent).toContain(en.gatewayCompatAuto)
+    act(() => setValue(selects[0]!, 'unsupported'))
+    expect(onChange).toHaveBeenLastCalledWith({ supportsDeveloperRole: 'unsupported' })
+    act(() => setValue(selects[1]!, 'auto'))
+    expect(onChange).toHaveBeenLastCalledWith({ maxTokensField: 'auto' })
+    act(() => root.unmount())
+    container.remove()
+  })
+
+  it('renders a distinct base source label instead of the protocol source label', () => {
+    const view = modelView({
+      provider: 'provider',
+      model: 'model-b',
+      supportsDeveloperRole: 'auto' as const,
+      maxTokensField: 'auto' as const,
+      supportsDeveloperRoleSource: 'base' as const,
+      maxTokensFieldSource: 'unknown' as const,
+      supportsDeveloperRoleAvailable: true,
+      maxTokensFieldAvailable: true,
+    })
+    const container = document.createElement('div')
+    document.body.append(container)
+    const root = createRoot(container)
+    act(() => {
+      root.render(<GatewayCompatControls scope="model" view={view} onChange={vi.fn()} availableCount={0} />)
+    })
+
+    expect(container.textContent).toContain(en.compatSourceBase)
+    expect(container.textContent).not.toContain(en.compatSourceProtocol)
+    act(() => root.unmount())
+    container.remove()
+  })
+
+  it('keeps the other model compat field editable when one field is unavailable', () => {
+    const view = modelView({
+      provider: 'provider',
+      model: 'model-b',
+      supportsDeveloperRole: 'auto' as const,
+      maxTokensField: 'max_tokens' as const,
+      supportsDeveloperRoleSource: 'unknown' as const,
+      maxTokensFieldSource: 'model' as const,
+      supportsDeveloperRoleAvailable: false,
+      maxTokensFieldAvailable: true,
+    })
+    const onChange = vi.fn()
+    const container = document.createElement('div')
+    document.body.append(container)
+    const root = createRoot(container)
+    act(() => {
+      root.render(<GatewayCompatControls scope="model" view={view} onChange={onChange} availableCount={0} />)
+    })
+
+    const selects = [...container.querySelectorAll('select')] as HTMLSelectElement[]
+    expect(selects).toHaveLength(1)
+    expect(selects[0]?.getAttribute('aria-label')).toBe(en.maxTokensField)
+    act(() => setValue(selects[0]!, 'max_completion_tokens'))
+    expect(onChange).toHaveBeenCalledWith({ maxTokensField: 'max_completion_tokens' })
+    act(() => root.unmount())
+    container.remove()
+  })
+
+  it('renders model compatibility copy from every locale without key fallbacks', () => {
+    const locales: readonly [string, Record<string, string>][] = [['en', en], ['zh', zh], ['ja', ja], ['ko', ko]]
+    const keys = ['modelGatewayCompatTitle', 'compatSourceBase', 'compatSourceModel', 'compatSourceProvider', 'compatSourceCatalog', 'compatSourceProtocol', 'compatSourceUnknown', 'inheritProviderCompat', 'saveModelGatewayCompat', 'modelGatewayCompatSaved']
+    const view = modelView({
+      provider: 'provider',
+      model: 'model-b',
+      supportsDeveloperRole: 'auto' as const,
+      maxTokensField: 'max_tokens' as const,
+      supportsDeveloperRoleSource: 'base' as const,
+      maxTokensFieldSource: 'unknown' as const,
+      supportsDeveloperRoleAvailable: true,
+      maxTokensFieldAvailable: true,
+    })
+    for (const [locale, dictionary] of locales) {
+      for (const key of keys) {
+        expect(dictionary[key], `${locale} missing ${key}`).toBeTruthy()
+        expect(dictionary[key], `${locale} fell back to ${key}`).not.toBe(key)
+      }
+      const container = document.createElement('div')
+      document.body.append(container)
+      const root = createRoot(container)
+      act(() => {
+        root.render(renderGatewayCompatControls({ scope: 'model', view, onChange: vi.fn(), availableCount: 0 }, { palette: iosPalette(), t: (key) => dictionary[key] ?? key }))
+      })
+      expect(container.textContent).toContain(dictionary.modelGatewayCompatTitle)
+      expect(container.textContent).toContain(dictionary.compatSourceBase)
+      expect(container.textContent).toContain(dictionary.inheritProviderCompat)
+      expect(container.textContent).not.toContain('compatSourceBase')
+      act(() => root.unmount())
+      container.remove()
+    }
+  })
+
+  it('renders the models[] save note from every locale in the model editor', () => {
+    const locales: readonly [string, Record<string, string>][] = [['en', en], ['zh', zh], ['ja', ja], ['ko', ko]]
+    const item: InventoryItem = { route: 'provider', model: 'model-a', name: 'Model A', levels: { off: null }, input: ['text'], raw: { id: 'model-a' }, index: 0, inOverrides: false }
+    const compatView = modelView({
+      provider: 'provider',
+      model: 'model-a',
+      supportsDeveloperRole: 'auto' as const,
+      maxTokensField: 'auto' as const,
+      supportsDeveloperRoleSource: 'provider' as const,
+      maxTokensFieldSource: 'provider' as const,
+      supportsDeveloperRoleAvailable: true,
+      maxTokensFieldAvailable: true,
+    })
+    for (const [locale, dictionary] of locales) {
+      const container = document.createElement('div')
+      document.body.append(container)
+      const root = createRoot(container)
+      act(() => {
+        root.render(<ModelEditor item={item} draft={{ off: { on: true, wire: '' } }} contextDraft={{ value: '', oneMillion: false, previousValue: '', touched: false }} inputDraft={{ text: true, image: false, touched: false }} dirty={false} busy={false} palette={iosPalette()} t={(key) => dictionary[key] ?? key} onLevelChange={vi.fn()} onContextChange={vi.fn()} onOneMillionChange={vi.fn()} onInputChange={vi.fn()} onSave={vi.fn()} onRestoreReasoning={vi.fn()} onRestoreCapability={vi.fn()} compatView={compatView} onCompatChange={vi.fn()} onSaveCompat={vi.fn()} />)
+      })
+      expect(container.textContent, `${locale} missing models[] save note`).toContain(dictionary.modelsArrayCompatSaveNote)
+      act(() => root.unmount())
+      container.remove()
+    }
+  })
+
+  it('renders model editor compat controls without changing base model controls', () => {
+    const item: InventoryItem = {
+      route: 'provider',
+      model: 'model-b',
+      name: 'Model B',
+      levels: { off: null },
+      contextWindow: 8192,
+      input: ['text', 'image'],
+      raw: { id: 'model-b' },
+      index: 1,
+      inOverrides: true,
+    }
+    const compatView = modelView({
+      provider: 'provider',
+      model: 'model-b',
+      supportsDeveloperRole: 'auto' as const,
+      maxTokensField: 'max_tokens' as const,
+      supportsDeveloperRoleSource: 'provider' as const,
+      maxTokensFieldSource: 'model' as const,
+      supportsDeveloperRoleAvailable: true,
+      maxTokensFieldAvailable: true,
+    })
+    const onCompatChange = vi.fn()
+    const onSaveCompat = vi.fn()
+    const container = document.createElement('div')
+    document.body.append(container)
+    const root = createRoot(container)
+    act(() => {
+      root.render(<ModelEditor item={item} draft={{ off: { on: true, wire: '' } }} contextDraft={{ value: '8192', oneMillion: false, previousValue: '8192', touched: false }} inputDraft={{ text: true, image: true, touched: false }} dirty={false} busy={false} palette={iosPalette()} t={text as Translation} onLevelChange={vi.fn()} onContextChange={vi.fn()} onOneMillionChange={vi.fn()} onInputChange={vi.fn()} onSave={vi.fn()} onRestoreReasoning={vi.fn()} onRestoreCapability={vi.fn()} compatView={compatView} onCompatChange={onCompatChange} onSaveCompat={onSaveCompat} />)
+    })
+
+    expect(container.textContent).toContain('model-b')
+    expect(container.textContent).toContain(text('reasoningLevels'))
+    expect(container.querySelector(`input[aria-label="${text('contextLength')}"]`)).not.toBeNull()
+    expect(container.textContent).toContain(text('textInput'))
+    const selects = [...container.querySelectorAll('select')] as HTMLSelectElement[]
+    expect(selects).toHaveLength(2)
+    act(() => setValue(selects[0]!, 'unsupported'))
+    expect(onCompatChange).toHaveBeenCalledWith({ supportsDeveloperRole: 'unsupported' })
+    act(() => root.unmount())
+    container.remove()
+  })
+
+  it('renders saveable model compat controls for models[] entries', () => {
+    const item: InventoryItem = {
+      route: 'provider',
+      model: 'model-a',
+      name: 'Model A',
+      levels: { off: null },
+      contextWindow: 8192,
+      input: ['text'],
+      raw: { id: 'model-a' },
+      index: 0,
+      inOverrides: false,
+    }
+    const compatView = modelView({
+      provider: 'provider',
+      model: 'model-a',
+      supportsDeveloperRole: 'auto' as const,
+      maxTokensField: 'auto' as const,
+      supportsDeveloperRoleSource: 'catalog' as const,
+      maxTokensFieldSource: 'protocol' as const,
+      supportsDeveloperRoleAvailable: true,
+      maxTokensFieldAvailable: true,
+    })
+    const onCompatChange = vi.fn()
+    const onSaveCompat = vi.fn()
+    const container = document.createElement('div')
+    document.body.append(container)
+    const root = createRoot(container)
+    act(() => {
+      root.render(<ModelEditor item={item} draft={{ off: { on: true, wire: '' } }} contextDraft={{ value: '8192', oneMillion: false, previousValue: '8192', touched: false }} inputDraft={{ text: true, image: false, touched: false }} dirty={false} busy={false} palette={iosPalette()} t={text as Translation} onLevelChange={vi.fn()} onContextChange={vi.fn()} onOneMillionChange={vi.fn()} onInputChange={vi.fn()} onSave={vi.fn()} onRestoreReasoning={vi.fn()} onRestoreCapability={vi.fn()} compatView={compatView} onCompatChange={onCompatChange} onSaveCompat={onSaveCompat} />)
+    })
+
+    expect(container.querySelectorAll('select')).toHaveLength(2)
+    expect(container.textContent).toContain(text('saveModelGatewayCompat'))
+    expect(onSaveCompat).not.toHaveBeenCalled()
+    expect(container.textContent).toContain(text('reasoningLevels'))
+    expect(container.querySelector(`input[aria-label="${text('contextLength')}"]`)).not.toBeNull()
+    act(() => root.unmount())
+    container.remove()
+  })
+
+  it('hides models[] compat controls when the source is not editable', () => {
+    const item: InventoryItem = { route: 'provider', model: 'legacy-model', name: 'Legacy Model', levels: { off: null }, input: ['text'], raw: { id: 'legacy-model' }, index: 0, inOverrides: false }
+    const compatView = modelView({
+      provider: 'provider',
+      model: 'legacy-model',
+      supportsDeveloperRole: 'auto' as const,
+      maxTokensField: 'auto' as const,
+      supportsDeveloperRoleSource: 'unknown' as const,
+      maxTokensFieldSource: 'unknown' as const,
+      supportsDeveloperRoleAvailable: false,
+      maxTokensFieldAvailable: false,
+    })
+    const container = document.createElement('div')
+    document.body.append(container)
+    const root = createRoot(container)
+    act(() => {
+      root.render(<ModelEditor item={item} draft={{ off: { on: true, wire: '' } }} contextDraft={{ value: '', oneMillion: false, previousValue: '', touched: false }} inputDraft={{ text: true, image: false, touched: false }} dirty={false} busy={false} palette={iosPalette()} t={text as Translation} onLevelChange={vi.fn()} onContextChange={vi.fn()} onOneMillionChange={vi.fn()} onInputChange={vi.fn()} onSave={vi.fn()} onRestoreReasoning={vi.fn()} onRestoreCapability={vi.fn()} compatView={compatView} onCompatChange={vi.fn()} onSaveCompat={vi.fn()} compatDirty={{}} />)
+    })
+    expect(container.querySelector('[data-scope="model"]')).toBeNull()
+    expect(container.textContent).not.toContain(text('saveModelGatewayCompat'))
+    expect(container.querySelector(`input[aria-label="${text('contextLength')}"]`)).not.toBeNull()
+    act(() => root.unmount())
+    container.remove()
+  })
+
+  it('hides model compat save controls when all model fields are unavailable', () => {
+    const item: InventoryItem = {
+      route: 'provider',
+      model: 'legacy-model',
+      name: 'Legacy Model',
+      levels: { off: null },
+      input: ['text'],
+      raw: { id: 'legacy-model' },
+      index: -1,
+      inOverrides: true,
+    }
+    const compatView = modelView({
+      provider: 'provider',
+      model: 'legacy-model',
+      supportsDeveloperRole: 'auto' as const,
+      maxTokensField: 'auto' as const,
+      supportsDeveloperRoleSource: 'unknown' as const,
+      maxTokensFieldSource: 'unknown' as const,
+      supportsDeveloperRoleAvailable: false,
+      maxTokensFieldAvailable: false,
+    })
+    const onSaveCompat = vi.fn()
+    const container = document.createElement('div')
+    document.body.append(container)
+    const root = createRoot(container)
+    act(() => {
+      root.render(<ModelEditor item={item} draft={{ off: { on: true, wire: '' } }} contextDraft={{ value: '', oneMillion: false, previousValue: '', touched: false }} inputDraft={{ text: true, image: false, touched: false }} dirty={false} busy={false} palette={iosPalette()} t={text as Translation} onLevelChange={vi.fn()} onContextChange={vi.fn()} onOneMillionChange={vi.fn()} onInputChange={vi.fn()} onSave={vi.fn()} onRestoreReasoning={vi.fn()} onRestoreCapability={vi.fn()} compatView={compatView} onSaveCompat={onSaveCompat} compatDirty={{}} />)
+    })
+
+    expect(container.querySelector('[data-scope="model"]')).toBeNull()
+    expect(container.textContent).not.toContain(text('saveModelGatewayCompat'))
+    expect(onSaveCompat).not.toHaveBeenCalled()
+    expect(container.textContent).toContain(text('reasoningLevels'))
+    act(() => root.unmount())
+    container.remove()
+  })
+
+  it('hides unavailable provider fields without hiding the settings page', async () => {
+    const view = renderEditor({
+      describe: async () => ({
+        ok: true,
+        value: {
+          namespaces: [namespace({
+            value: { providers: { provider: { models: [{ id: 'model-a' }] } } },
+            schema: {},
+          })],
+        },
+      }),
+    })
+    await settle()
+    expect(view.container.textContent).toContain(text('pageTitle'))
+    expect(view.container.textContent).not.toContain(text('supportsDeveloperRole'))
+    expect(view.container.textContent).not.toContain(text('maxTokensField'))
+    view.unmount()
+  })
+
+  it('hides the provider gateway-compat panel while the provider is collapsed and restores dirty edits on re-expand', async () => {
+    const providerNamespace = namespace({
+      value: { providers: { provider: { models: [{ id: 'model-a' }] } } },
+      schema: realGatewaySchema,
+    })
+    const view = renderEditor({
+      compatibilityProfile: 'modern',
+      describe: async () => ({ ok: true, value: { namespaces: [providerNamespace] } }),
+    })
+    await settle()
+
+    expect(view.container.querySelector('[data-scope="provider"]')).toBeNull()
+    act(() => providerButton(view.container).click())
+    const providerControls = view.container.querySelector('[data-scope="provider"]') as HTMLElement
+    expect(providerControls).not.toBeNull()
+    const supports = providerControls.querySelector(`select[aria-label="${text('supportsDeveloperRole')}"]`) as HTMLSelectElement
+    expect(supports).not.toBeNull()
+    act(() => setValue(supports, 'unsupported'))
+    expect(button(providerControls.parentElement!, text('saveGatewayCompat'))).toBeDefined()
+
+    act(() => button(view.container, text('collapseProvider')).click())
+    expect(view.container.querySelector('[data-scope="provider"]')).toBeNull()
+    expect(view.container.querySelector(`button[aria-label="${text('saveGatewayCompat')}"]`)).toBeNull()
+
+    act(() => providerButton(view.container).click())
+    const restored = view.container.querySelector('[data-scope="provider"]') as HTMLElement
+    expect(restored).not.toBeNull()
+    expect((restored.querySelector(`select[aria-label="${text('supportsDeveloperRole')}"]`) as HTMLSelectElement).value).toBe('unsupported')
+    expect(button(restored.parentElement!, text('saveGatewayCompat'))).toBeDefined()
+    view.unmount()
+  })
+
+  it('projects provider compat sources and saves field-level operations', async () => {
+    const provider = {
+      models: [{ id: 'model-a' }],
+      compat: { supportsDeveloperRole: true, maxTokensField: 'max_completion_tokens' },
+    }
+    const projected = providerGatewayCompatViewFrom({
+      value: { providers: { provider } },
+      user: { providers: { provider: { compat: { supportsDeveloperRole: false } } } },
+      base: { providers: { provider: { compat: { maxTokensField: 'max_tokens' } } } },
+      schema: realGatewaySchema,
+    }, 'provider', 'modern')
+    expect(projected).toMatchObject({ supportsDeveloperRole: 'unsupported', maxTokensField: 'auto', source: 'user' })
+
+    const view = renderEditor({
+      compatibilityProfile: 'modern',
+      describe: async () => ({ ok: true, value: { namespaces: [namespace({
+        value: { providers: { provider } },
+        user: { providers: { provider: { compat: { supportsDeveloperRole: false } } } },
+        base: { providers: { provider: { compat: { maxTokensField: 'max_tokens' } } } },
+        schema: realGatewaySchema,
+      })] } }),
+    })
+    await settle()
+    act(() => providerButton(view.container).click())
+    expect(view.container.textContent).toContain(text('gatewayCompatTitle'))
+    const selects = [...view.container.querySelectorAll('select')].slice(2) as HTMLSelectElement[]
+    expect(selects[0]?.value).toBe('unsupported')
+    act(() => setValue(selects[1]!, 'max_completion_tokens'))
+    act(() => button(view.container, text('saveGatewayCompat')).click())
+    await settle()
+    expect(view.mutate).toHaveBeenCalledWith('llm-pi-ai', [
+      { op: 'set', path: ['providers', 'provider', 'compat', 'maxTokensField'], value: 'max_completion_tokens' },
+    ], 2)
+    view.unmount()
+  })
+
+  it('saves both provider compatibility fields in one mutation', async () => {
+    const providerNamespace = namespace({
+      value: { providers: { provider: { models: [{ id: 'model-a' }] } } },
+      schema: realGatewaySchema,
+    })
+    const view = renderEditor({
+      compatibilityProfile: 'modern',
+      describe: async () => ({ ok: true, value: { namespaces: [providerNamespace] } }),
+      mutate: async (_ns, _ops, _revision) => ({ ok: true as const, value: providerNamespace }),
+    })
+    await settle()
+    act(() => providerButton(view.container).click())
+
+    const providerControls = [...view.container.querySelectorAll('[data-scope="provider"]')]
+    expect(providerControls).toHaveLength(1)
+    const selects = [...providerControls[0]!.querySelectorAll('select')] as HTMLSelectElement[]
+    act(() => setValue(selects[0]!, 'unsupported'))
+    act(() => setValue(selects[1]!, 'max_tokens'))
+    act(() => button(providerControls[0]!.parentElement!, text('saveGatewayCompat')).click())
+    await settle()
+
+    expect(view.mutate).toHaveBeenCalledWith('llm-pi-ai', [
+      { op: 'set', path: ['providers', 'provider', 'compat', 'supportsDeveloperRole'], value: false },
+      { op: 'set', path: ['providers', 'provider', 'compat', 'maxTokensField'], value: 'max_tokens' },
+    ], 2)
+    view.unmount()
+  })
+
+  it('saves a new scalar field and leaves already-changed fields pending', async () => {
+    const providerNamespace = namespace({
+      value: { providers: { provider: { models: [{ id: 'model-a' }] } } },
+      schema: realGatewaySchema,
+    })
+    let capturedOps: readonly SettingsOp[] | undefined
+    const view = renderEditor({
+      compatibilityProfile: 'modern',
+      describe: async () => ({ ok: true, value: { namespaces: [providerNamespace] } }),
+      mutate: async (_ns, ops) => {
+        capturedOps = ops
+        return { ok: true as const, value: providerNamespace }
+      },
+    })
+    await settle()
+    act(() => providerButton(view.container).click())
+
+    const providerControls = view.container.querySelector('[data-scope="provider"]') as HTMLElement
+    expect(providerControls).not.toBeNull()
+    act(() => button(providerControls, text('gatewayMoreFields', { count: 13 })).click())
+    const supportsStore = providerControls.querySelector(`select[aria-label="${text('supportsStore')}"]`) as HTMLSelectElement
+    const thinkingFormat = providerControls.querySelector(`select[aria-label="${text('thinkingFormat')}"]`) as HTMLSelectElement
+    expect(supportsStore).not.toBeNull()
+    expect(thinkingFormat).not.toBeNull()
+    act(() => setValue(supportsStore, 'unsupported'))
+    act(() => setValue(thinkingFormat, 'deepseek'))
+    act(() => button(providerControls.parentElement!, text('saveGatewayCompat')).click())
+    await settle()
+
+    expect(capturedOps).toEqual([
+      { op: 'set', path: ['providers', 'provider', 'compat', 'thinkingFormat'], value: 'deepseek' },
+      { op: 'set', path: ['providers', 'provider', 'compat', 'supportsStore'], value: false },
+    ])
+    expect(view.mutate).toHaveBeenCalledTimes(1)
+    view.unmount()
+  })
+
+  it('retains another provider draft when the first provider save succeeds', async () => {
+    const providers = {
+      providerA: { models: [{ id: 'model-a' }] },
+      providerB: { models: [{ id: 'model-b' }] },
+    }
+    const initial = namespace({ value: { providers }, schema: realGatewaySchema })
+    const saved = namespace({
+      revision: 3,
+      value: { providers },
+      user: { providers: { providerA: { compat: { maxTokensField: 'max_tokens' } } } },
+      schema: realGatewaySchema,
+    })
+    const view = renderEditor({
+      compatibilityProfile: 'modern',
+      describe: async () => ({ ok: true, value: { namespaces: [initial] } }),
+      mutate: async (_ns, ops) => {
+        expect(ops).toEqual([{ op: 'set', path: ['providers', 'providerA', 'compat', 'maxTokensField'], value: 'max_tokens' }])
+        return { ok: true as const, value: saved }
+      },
+    })
+    await settle()
+    for (const expand of [...view.container.querySelectorAll<HTMLButtonElement>(`button[aria-label="${text('expandProvider')}"]`)]) act(() => expand.click())
+
+    const providerControls = [...view.container.querySelectorAll('[data-scope="provider"]')]
+    expect(providerControls).toHaveLength(2)
+    const providerASelects = [...providerControls[0]!.querySelectorAll('select')] as HTMLSelectElement[]
+    const providerBSelects = [...providerControls[1]!.querySelectorAll('select')] as HTMLSelectElement[]
+    act(() => setValue(providerBSelects[1]!, 'max_completion_tokens'))
+    act(() => setValue(providerASelects[1]!, 'max_tokens'))
+    act(() => button(providerControls[0]!.parentElement!, text('saveGatewayCompat')).click())
+    await settle()
+
+    const refreshed = [...view.container.querySelectorAll('[data-scope="provider"]')]
+    expect((refreshed[1]!.querySelectorAll('select')[1] as HTMLSelectElement).value).toBe('max_completion_tokens')
+    expect(button(refreshed[1]!.parentElement!, text('saveGatewayCompat'))).toBeDefined()
+    view.unmount()
+  })
+
+  it('refreshes provider defaults without replacing dirty model compat drafts', async () => {
+    const initial = namespace({
+      value: {
+        providers: {
+          provider: {
+            modelOverrides: {
+              'model-a': { id: 'model-a', input: ['text'] },
+              'model-b': { id: 'model-b', input: ['text'] },
+            },
+          },
+        },
+      },
+      user: { providers: { provider: { compat: { supportsDeveloperRole: false } } } },
+      base: { providers: { provider: { compat: { maxTokensField: 'max_completion_tokens' } } } },
+      schema: realGatewaySchema,
+    })
+    const refreshed = namespace({
+      revision: 8,
+      value: initial.value,
+      user: { providers: { provider: { compat: { supportsDeveloperRole: false, maxTokensField: 'max_tokens' } } } },
+      base: initial.base,
+      schema: realGatewaySchema,
+    })
+    const initialModelA = inventoryFrom(initial).find((item) => item.model === 'model-a')
+    const refreshedModelB = inventoryFrom(refreshed).find((item) => item.model === 'model-b')
+    expect(initialModelA).toBeDefined()
+    expect(refreshedModelB).toBeDefined()
+    expect(modelGatewayCompatViewFrom(initial, initialModelA!, 'modern')).toMatchObject({
+      maxTokensField: 'auto',
+      maxTokensFieldResolved: 'max_completion_tokens',
+      maxTokensFieldSource: 'base',
+    })
+
+    const view = renderEditor({
+      compatibilityProfile: 'modern',
+      describe: async () => ({ ok: true, value: { namespaces: [initial] } }),
+      mutate: async (_ns, ops, revision) => {
+        expect(revision).toBe(2)
+        expect(ops).toEqual([{ op: 'set', path: ['providers', 'provider', 'compat', 'maxTokensField'], value: 'max_tokens' }])
+        expect(ops.some((op) => op.path.includes('modelOverrides'))).toBe(false)
+        return { ok: true as const, value: refreshed }
+      },
+    })
+    await settle()
+    act(() => providerButton(view.container).click())
+    const modelButtons = [...view.container.querySelectorAll<HTMLButtonElement>(`button[aria-label="${text('openModelSettings')}"]`)]
+    const modelAButton = modelButtons.find((candidate) => candidate.parentElement?.parentElement?.parentElement?.textContent?.includes('model-a'))
+    expect(modelAButton).toBeDefined()
+    act(() => modelAButton!.click())
+    const dirtyModel = view.container.querySelector('[data-scope="model"]')
+    expect(dirtyModel?.textContent).toContain(text('compatSourceBase'))
+    const modelAMaxTokens = dirtyModel?.querySelector(`select[aria-label="${text('maxTokensField')}"]`) as HTMLSelectElement
+    act(() => setValue(modelAMaxTokens, 'max_completion_tokens'))
+
+    const providerMaxTokens = view.container.querySelector(`[data-scope="provider"] select[aria-label="${text('maxTokensField')}"]`) as HTMLSelectElement
+    act(() => setValue(providerMaxTokens, 'max_tokens'))
+    act(() => button(view.container, text('saveGatewayCompat')).click())
+    await settle()
+
+    expect((view.container.querySelector(`[data-scope="provider"] select[aria-label="${text('maxTokensField')}"]`) as HTMLSelectElement).value).toBe('max_tokens')
+    const refreshedDirtyModel = view.container.querySelector('[data-scope="model"]')
+    expect((refreshedDirtyModel?.querySelector(`select[aria-label="${text('maxTokensField')}"]`) as HTMLSelectElement).value).toBe('max_completion_tokens')
+    expect(refreshedDirtyModel?.textContent).toContain(text('compatSourceProvider'))
+    expect(refreshedDirtyModel?.textContent).not.toContain(text('compatSourceBase'))
+
+    expect(modelGatewayCompatViewFrom(refreshed, refreshedModelB!, 'modern')).toMatchObject({
+      maxTokensField: 'auto',
+      maxTokensFieldResolved: 'max_tokens',
+      maxTokensFieldSource: 'provider',
+    })
+    const modelBButton = [...view.container.querySelectorAll<HTMLButtonElement>(`button[aria-label="${text('openModelSettings')}"]`)]
+      .find((candidate) => candidate.parentElement?.parentElement?.parentElement?.textContent?.includes('model-b'))
+    expect(modelBButton).toBeDefined()
+    act(() => modelBButton!.click())
+    const cleanModel = view.container.querySelectorAll('[data-scope="model"]')[1]
+    expect((cleanModel?.querySelector(`select[aria-label="${text('maxTokensField')}"]`) as HTMLSelectElement).value).toBe('auto')
+    expect(cleanModel?.textContent).toContain(text('compatSourceProvider'))
+    expect(cleanModel?.textContent).not.toContain(text('compatSourceBase'))
+    view.unmount()
+  })
+
+  it('renders provider controls from the runtime takeover projection', async () => {
+    const takeoverResolution: TakeoverRuntimeResolution = {
+      providers: ['provider'],
+      compat: [resolveGatewayCompat({
+        provider: 'provider',
+        model: 'model-a',
+        modelCompat: { thinkingFormat: 'qwen', supportsReasoningEffort: true },
+        providerCompat: { supportsDeveloperRole: false, maxTokensField: 'max_completion_tokens' },
+      })],
+    }
+    const view = renderEditor({
+      compatibilityProfile: 'modern',
+      takeoverResolution,
+      describe: async () => ({ ok: true, value: { namespaces: [namespace({
+        value: { providers: { provider: { models: [{ id: 'model-a' }] } } },
+        schema: realGatewaySchema,
+      })] } }),
+    })
+    await settle()
+    act(() => providerButton(view.container).click())
+
+    const selects = [...view.container.querySelectorAll('select')].slice(2) as HTMLSelectElement[]
+    expect(selects[0]?.value).toBe('auto')
+    expect(selects[1]?.value).toBe('auto')
+    view.unmount()
+  })
+
+  it('saves model override compat changes and clears them back to provider inheritance', async () => {
+    const modelNamespace = namespace({
+      value: {
+        providers: {
+          provider: {
+            modelOverrides: {
+              'model-a': { id: 'model-a', name: 'Model A', input: ['text'] },
+              'model-b': { id: 'model-b', name: 'Model B', input: ['text'] },
+            },
+          },
+        },
+      },
+      user: {
+        providers: {
+          provider: {
+            compat: { supportsDeveloperRole: false },
+            modelOverrides: {
+              'model-b': { compat: { maxTokensField: 'max_completion_tokens' } },
+            },
+          },
+        },
+      },
+      schema: realGatewaySchema,
+    })
+    const savedNamespace = namespace({
+      revision: 7,
+      value: modelNamespace.value,
+      user: {
+        providers: {
+          provider: {
+            compat: { supportsDeveloperRole: false },
+            modelOverrides: {
+              'model-b': { compat: { maxTokensField: 'max_tokens' } },
+            },
+          },
+        },
+      },
+      schema: realGatewaySchema,
+    })
+    let mutationCount = 0
+    const view = renderEditor({
+      compatibilityProfile: 'modern',
+      describe: async () => ({ ok: true, value: { namespaces: [modelNamespace] } }),
+      mutate: async () => ({ ok: true as const, value: mutationCount++ === 0 ? savedNamespace : modelNamespace }),
+    })
+    await settle()
+
+    act(() => providerButton(view.container).click())
+    const modelBButton = [...view.container.querySelectorAll<HTMLButtonElement>(`button[aria-label="${text('openModelSettings')}"]`)]
+      .find((candidate) => candidate.parentElement?.parentElement?.parentElement?.textContent?.includes('model-b'))
+    expect(modelBButton).toBeDefined()
+    act(() => modelBButton!.click())
+
+    const maxTokens = view.container.querySelector(`[data-scope="model"] select[aria-label="${text('maxTokensField')}"]`) as HTMLSelectElement
+    expect(maxTokens).not.toBeNull()
+    expect(maxTokens.value).toBe('max_completion_tokens')
+    act(() => setValue(maxTokens, 'max_tokens'))
+    act(() => button(view.container, text('saveModelGatewayCompat')).click())
+    await settle()
+
+    expect(view.mutate).toHaveBeenNthCalledWith(1, 'llm-pi-ai', [{
+      op: 'set',
+      path: ['providers', 'provider', 'modelOverrides', 'model-b', 'compat', 'maxTokensField'],
+      value: 'max_tokens',
+    }], 2)
+
+    const refreshedMaxTokens = view.container.querySelector(`[data-scope="model"] select[aria-label="${text('maxTokensField')}"]`) as HTMLSelectElement
+    act(() => setValue(refreshedMaxTokens, 'auto'))
+    act(() => button(view.container, text('saveModelGatewayCompat')).click())
+    await settle()
+
+    expect(view.mutate).toHaveBeenNthCalledWith(2, 'llm-pi-ai', [{
+      op: 'unset',
+      path: ['providers', 'provider', 'modelOverrides', 'model-b', 'compat', 'maxTokensField'],
+    }], 7)
+    view.unmount()
+  })
+
+  it('keeps the model compat draft after a stale revision conflict', async () => {
+    const modelNamespace = namespace({
+      value: { providers: { provider: { modelOverrides: { 'model-b': { id: 'model-b', input: ['text'] } } } } },
+      user: { providers: { provider: { modelOverrides: { 'model-b': { compat: { maxTokensField: 'max_completion_tokens' } } } } } },
+      schema: realGatewaySchema,
+    })
+    const view = renderEditor({
+      compatibilityProfile: 'modern',
+      describe: async () => ({ ok: true, value: { namespaces: [modelNamespace] } }),
+      mutate: async () => ({ ok: false, error: { message: 'stale revision' } }),
+    })
+    await settle()
+    act(() => providerButton(view.container).click())
+    const modelBButton = [...view.container.querySelectorAll<HTMLButtonElement>(`button[aria-label="${text('openModelSettings')}"]`)]
+      .find((candidate) => candidate.parentElement?.parentElement?.parentElement?.textContent?.includes('model-b'))
+    expect(modelBButton).toBeDefined()
+    act(() => modelBButton!.click())
+    const maxTokens = view.container.querySelector(`[data-scope="model"] select[aria-label="${text('maxTokensField')}"]`) as HTMLSelectElement
+    act(() => setValue(maxTokens, 'max_tokens'))
+    act(() => button(view.container, text('saveModelGatewayCompat')).click())
+    await settle()
+
+    expect(view.mutate).toHaveBeenCalledWith('llm-pi-ai', [{
+      op: 'set',
+      path: ['providers', 'provider', 'modelOverrides', 'model-b', 'compat', 'maxTokensField'],
+      value: 'max_tokens',
+    }], 2)
+    expect(view.container.querySelector('[role="alert"]')?.textContent).toContain('stale revision')
+    expect((view.container.querySelector(`[data-scope="model"] select[aria-label="${text('maxTokensField')}"]`) as HTMLSelectElement).value).toBe('max_tokens')
+    expect(view.container.querySelector('[title="' + text('unsaved') + '"]')).not.toBeNull()
+    view.unmount()
+  })
+
+  it('saves a new model override scalar field via the model group expansion', async () => {
+    const modelNamespace = namespace({
+      value: {
+        providers: {
+          provider: {
+            modelOverrides: {
+              'model-a': { id: 'model-a', name: 'Model A', input: ['text'] },
+            },
+          },
+        },
+      },
+      schema: realGatewaySchema,
+    })
+    const view = renderEditor({
+      compatibilityProfile: 'modern',
+      describe: async () => ({ ok: true, value: { namespaces: [modelNamespace] } }),
+      mutate: async (_ns, _ops, _revision) => ({ ok: true as const, value: modelNamespace }),
+    })
+    await settle()
+
+    act(() => providerButton(view.container).click())
+    const modelAButton = [...view.container.querySelectorAll<HTMLButtonElement>(`button[aria-label="${text('openModelSettings')}"]`)]
+      .find((candidate) => candidate.parentElement?.parentElement?.parentElement?.textContent?.includes('model-a'))
+    expect(modelAButton).toBeDefined()
+    act(() => modelAButton!.click())
+
+    const modelControls = view.container.querySelector('[data-scope="model"]') as HTMLElement
+    expect(modelControls).not.toBeNull()
+    expect(modelControls.querySelector(`select[aria-label="${text('supportsStore')}"]`)).toBeNull()
+    act(() => button(modelControls, text('gatewayMoreFields', { count: 13 })).click())
+    const supportsStore = modelControls.querySelector(`select[aria-label="${text('supportsStore')}"]`) as HTMLSelectElement
+    const thinkingFormat = modelControls.querySelector(`select[aria-label="${text('thinkingFormat')}"]`) as HTMLSelectElement
+    expect(supportsStore).not.toBeNull()
+    expect(thinkingFormat).not.toBeNull()
+    act(() => setValue(supportsStore, 'unsupported'))
+    act(() => setValue(thinkingFormat, 'deepseek'))
+    expect(view.container.querySelector('[title="' + text('unsaved') + '"]')).not.toBeNull()
+    act(() => button(view.container, text('saveModelGatewayCompat')).click())
+    await settle()
+
+    expect(view.mutate).toHaveBeenCalledWith('llm-pi-ai', [
+      { op: 'set', path: ['providers', 'provider', 'modelOverrides', 'model-a', 'compat', 'thinkingFormat'], value: 'deepseek' },
+      { op: 'set', path: ['providers', 'provider', 'modelOverrides', 'model-a', 'compat', 'supportsStore'], value: false },
+    ], 2)
+    view.unmount()
+  })
+
+  it('fails closed for conflicting model sources while keeping provider and baseline editors', async () => {
+    const conflict = namespace({
+      value: {
+        providers: {
+          provider: {
+            compat: { supportsDeveloperRole: false, maxTokensField: 'max_tokens' },
+            models: [{ id: 'model-a', name: 'Model A', reasoningEfforts: { off: null }, input: ['text'] }],
+            modelOverrides: { 'override-model': { id: 'override-model', name: 'Override Model', reasoningEfforts: { off: null }, input: ['text'], compat: { maxTokensField: 'max_completion_tokens' } } },
+          },
+        },
+      },
+      schema: realGatewaySchema,
+    })
+    const view = renderEditor({
+      compatibilityProfile: 'modern',
+      describe: async () => ({ ok: true, value: { namespaces: [conflict] } }),
+    })
+    await settle()
+
+    act(() => providerButton(view.container).click())
+    expect(view.container.querySelector('[data-scope="provider"]')).not.toBeNull()
+    const overrideModelButton = [...view.container.querySelectorAll<HTMLButtonElement>(`button[aria-label="${text('openModelSettings')}"]`)]
+      .find((candidate) => candidate.parentElement?.parentElement?.parentElement?.textContent?.includes('override-model'))
+    expect(overrideModelButton).toBeDefined()
+    act(() => overrideModelButton!.click())
+    expect(view.container.querySelector('[data-scope="model"]')).toBeNull()
+    expect(view.container.querySelector(`input[aria-label="${text('contextLength')}"]`)).not.toBeNull()
+    expect(view.container.textContent).toContain(text('reasoningLevels'))
+    expect(view.container.textContent).not.toContain(text('saveModelGatewayCompat'))
+    view.unmount()
+  })
+
+  it('hides dirty model compat drafts after a conflict refresh while retaining baseline controls', async () => {
+    const initial = namespace({
+      value: {
+        providers: {
+          provider: {
+            compat: { supportsDeveloperRole: false },
+            models: [{ id: 'model-a', name: 'Model A', input: ['text'] }],
+          },
+        },
+      },
+      user: {
+        providers: {
+          provider: {
+            models: [{ id: 'model-a', name: 'Model A', input: ['text'], compat: { maxTokensField: 'max_tokens' } }],
+          },
+        },
+      },
+      schema: realGatewaySchema,
+    })
+    const conflict = namespace({
+      revision: 3,
+      value: {
+        providers: {
+          provider: {
+            compat: { supportsDeveloperRole: false },
+            models: [{ id: 'model-a', name: 'Model A', input: ['text'] }],
+            modelOverrides: { 'model-a': { id: 'model-a', input: ['text'] } },
+          },
+        },
+      },
+      schema: realGatewaySchema,
+    })
+    const view = renderEditor({
+      compatibilityProfile: 'modern',
+      describe: async () => ({ ok: true, value: { namespaces: [initial] } }),
+      mutate: async (_ns, ops) => {
+        expect(ops).toEqual([{ op: 'set', path: ['providers', 'provider', 'compat', 'supportsDeveloperRole'], value: true }])
+        return { ok: true as const, value: conflict }
+      },
+    })
+    await settle()
+    act(() => providerButton(view.container).click())
+    act(() => modelSettingsButton(view.container).click())
+    const modelMaxTokens = view.container.querySelector(`[data-scope="model"] select[aria-label="${text('maxTokensField')}"]`) as HTMLSelectElement
+    act(() => setValue(modelMaxTokens, 'max_completion_tokens'))
+    expect(modelMaxTokens.value).toBe('max_completion_tokens')
+    expect(view.container.querySelector('[title="' + text('unsaved') + '"]')).not.toBeNull()
+    expect(view.container.querySelector('[data-scope="model"]')).not.toBeNull()
+    const providerSupports = view.container.querySelector(`[data-scope="provider"] select[aria-label="${text('supportsDeveloperRole')}"]`) as HTMLSelectElement
+    act(() => setValue(providerSupports, 'supported'))
+    act(() => button(view.container, text('saveGatewayCompat')).click())
+    await settle()
+
+    expect(view.mutate).toHaveBeenCalledTimes(1)
+    expect(view.container.querySelector('[data-scope="model"]')).toBeNull()
+    expect(view.container.textContent).not.toContain(text('saveModelGatewayCompat'))
+    expect(view.container.querySelector(`input[aria-label="${text('contextLength')}"]`)).not.toBeNull()
+    view.unmount()
+  })
+
+  it('offers saveable model compat controls for models array entries', async () => {
+    const modelNamespace = namespace({
+      value: {
+        providers: {
+          provider: {
+            models: [{ id: 'model-a', name: 'Model A', compat: { maxTokensField: 'max_completion_tokens' } }],
+          },
+        },
+      },
+      schema: realGatewaySchema,
+    })
+    const view = renderEditor({
+      compatibilityProfile: 'modern',
+      describe: async () => ({ ok: true, value: { namespaces: [modelNamespace] } }),
+      mutate: async () => ({ ok: true, value: modelNamespace }),
+    })
+    await settle()
+
+    act(() => providerButton(view.container).click())
+    act(() => modelSettingsButton(view.container).click())
+    expect(view.container.querySelector('[data-scope="model"]')).not.toBeNull()
+    expect(view.container.textContent).toContain(text('saveModelGatewayCompat'))
+    expect(view.mutate).not.toHaveBeenCalled()
+    view.unmount()
+  })
+
+  it('shows and saves compat controls for a models[] model with one complete array set', async () => {
+    const modelNamespace = namespace({
+      value: {
+        providers: {
+          provider: {
+            models: [
+              { id: 'model-a', name: 'Model A', custom: 'keep-a', compat: { maxTokensField: 'max_tokens', keep: true } },
+              { id: 'model-b', name: 'Model B', custom: 'keep-b' },
+            ],
+          },
+        },
+      },
+      schema: realGatewaySchema,
+    })
+    const view = renderEditor({
+      compatibilityProfile: 'modern',
+      describe: async () => ({ ok: true, value: { namespaces: [modelNamespace] } }),
+      mutate: async (_ns, ops) => {
+        expect(ops).toEqual([{
+          op: 'set',
+          path: ['providers', 'provider', 'models'],
+          value: [
+            { id: 'model-a', name: 'Model A', custom: 'keep-a', compat: { maxTokensField: 'max_tokens', keep: true, supportsDeveloperRole: false } },
+            { id: 'model-b', name: 'Model B', custom: 'keep-b' },
+          ],
+        }])
+        return { ok: true as const, value: modelNamespace }
+      },
+    })
+    await settle()
+    act(() => providerButton(view.container).click())
+    act(() => modelSettingsButton(view.container).click())
+
+    const modelControls = view.container.querySelector('[data-scope="model"]')
+    expect(modelControls).not.toBeNull()
+    const supportsDeveloperRole = modelControls?.querySelector(`select[aria-label="${text('supportsDeveloperRole')}"]`) as HTMLSelectElement
+    expect(supportsDeveloperRole).not.toBeNull()
+    act(() => setValue(supportsDeveloperRole, 'unsupported'))
+    act(() => button(view.container, text('saveModelGatewayCompat')).click())
+    await settle()
+    expect(view.mutate).toHaveBeenCalledTimes(1)
+    view.unmount()
+  })
+
+  it('uses one array set for models[] Auto and keeps the draft after a failed mutation', async () => {
+    const modelNamespace = namespace({
+      value: {
+        providers: {
+          provider: {
+            models: [
+              { id: 'model-a', custom: 'keep-a' },
+              { id: 'model-b', custom: 'keep-b', compat: { maxTokensField: 'max_completion_tokens', other: true } },
+            ],
+          },
+        },
+      },
+      user: {
+        providers: {
+          provider: {
+            models: [
+              { id: 'model-a', custom: 'keep-a' },
+              { id: 'model-b', custom: 'keep-b', compat: { maxTokensField: 'max_completion_tokens', other: true } },
+            ],
+          },
+        },
+      },
+      schema: realGatewaySchema,
+    })
+    const view = renderEditor({
+      compatibilityProfile: 'modern',
+      describe: async () => ({ ok: true, value: { namespaces: [modelNamespace] } }),
+      mutate: async (_ns, ops) => {
+        expect(ops).toEqual([{
+          op: 'set',
+          path: ['providers', 'provider', 'models'],
+          value: [
+            { id: 'model-a', custom: 'keep-a' },
+            { id: 'model-b', custom: 'keep-b', compat: { other: true } },
+          ],
+        }])
+        return { ok: false as const, error: { message: 'stale revision' } }
+      },
+    })
+    await settle()
+    act(() => providerButton(view.container).click())
+    const modelBButton = [...view.container.querySelectorAll<HTMLButtonElement>(`button[aria-label="${text('openModelSettings')}"]`)]
+      .find((candidate) => candidate.parentElement?.parentElement?.parentElement?.textContent?.includes('model-b'))
+    expect(modelBButton).toBeDefined()
+    act(() => modelBButton!.click())
+    const maxTokens = view.container.querySelector(`[data-scope="model"] select[aria-label="${text('maxTokensField')}"]`) as HTMLSelectElement
+    act(() => setValue(maxTokens, 'auto'))
+    act(() => button(view.container, text('saveModelGatewayCompat')).click())
+    await settle()
+
+    expect(view.container.querySelector('[role="alert"]')?.textContent).toContain('stale revision')
+    expect(maxTokens.value).toBe('auto')
+    expect(view.container.querySelector('[title="' + text('unsaved') + '"]')).not.toBeNull()
+    view.unmount()
+  })
+
+  it('shows loading first and then reports a describe failure', async () => {
+    let resolveDescribe!: (value: ClientResult<{ namespaces: readonly SettingsNamespace[] }>) => void
+    const describe = vi.fn(() => new Promise<ClientResult<{ namespaces: readonly SettingsNamespace[] }>>((resolve) => {
+      resolveDescribe = resolve
+    }))
+    const view = renderEditor({ describe })
+    expect(view.container.textContent).toContain(text('loading'))
+
+    await act(async () => {
+      resolveDescribe({ ok: false, error: { message: 'offline' } })
+      await Promise.resolve()
+    })
+    expect(view.container.querySelector('[role="alert"]')?.textContent).toContain('offline')
+    view.unmount()
+  })
+
+  it('shows the provider default when the namespace exists without an effort', async () => {
+    const view = renderEditor({
+      describe: async () => ({ ok: true, value: { namespaces: [namespace({ user: { subagentEffort: null } })] } }),
+    })
+    await settle()
+    expect(view.container.textContent).toContain(text('currentDefault', { effort: text('providerDefault') }))
+    expect(view.container.textContent).not.toContain(text('unconfiguredSubagent'))
+    view.unmount()
+  })
+
+  it('filters models by search and expands the matching provider and model', async () => {
+    const view = renderEditor()
+    await settle()
+    const search = view.container.querySelector(`input[placeholder="${text('searchPlaceholder')}"]`) as HTMLInputElement
+    act(() => {
+      setValue(search, 'override')
+    })
+    expect(view.container.textContent).toContain('override-a')
+    expect(view.container.textContent).not.toContain('Model A')
+    expect(view.container.querySelector(`button[aria-label="${text('expandProvider')}"]`)).toBeNull()
+    expect(view.container.querySelector(`button[aria-label="${text('openModelSettings')}"]`)).not.toBeNull()
+    act(() => modelSettingsButton(view.container).click())
+    expect(view.container.textContent).toContain(text('reasoningLevels'))
+    view.unmount()
+  })
+
+  it('updates an effort wire value, context mode, and input modalities before saving', async () => {
+    const saved = namespace({ revision: 3 })
+    const view = renderEditor({
+      mutate: async (_ns, _ops, _revision) => ({ ok: true as const, value: saved }),
+    })
+    await settle()
+    openFirstModel(view.container)
+
+    const minimal = button(view.container, `${text('levelMinimal')}${text('levelSuffix')}`)
+    act(() => minimal.click())
+    const wire = view.container.querySelector('input[placeholder="' + text('wirePlaceholder') + '"]') as HTMLInputElement
+    expect(wire.value).toBe('minimal')
+    act(() => {
+      setValue(wire, 'ultra')
+    })
+
+    const context = view.container.querySelector(`input[aria-label="${text('contextLength')}"]`) as HTMLInputElement
+    act(() => {
+      setValue(context, '64000')
+    })
+    const million = allSwitches(view.container).find((candidate) => candidate.getAttribute('aria-label') === text('oneMillionMode'))
+    expect(million).toBeDefined()
+    act(() => million!.click())
+    expect(context.value).toBe('1000000')
+
+    const textSwitch = allSwitches(view.container).find((candidate) => candidate.getAttribute('aria-label') === text('textInput'))
+    const imageSwitch = allSwitches(view.container).find((candidate) => candidate.getAttribute('aria-label') === text('imageInput'))
+    expect(textSwitch?.getAttribute('aria-checked')).toBe('true')
+    act(() => imageSwitch!.click())
+    act(() => textSwitch!.click())
+    expect(textSwitch?.getAttribute('aria-checked')).toBe('false')
+
+    act(() => button(view.container, text('saveModelChanges')).click())
+    await settle()
+    expect(view.mutate).toHaveBeenCalledWith('llm-pi-ai', expect.arrayContaining([
+      expect.objectContaining({ path: ['providers', 'provider', 'models'] }),
+    ]), 2)
+    const ops = view.mutate.mock.calls[0][1] as SettingsOp[]
+    const model = (ops[0].value as Array<Record<string, unknown>>)[0]
+    expect(model.reasoningEfforts).toEqual({ off: null, minimal: 'ultra' })
+    expect(model.contextWindow).toBe(1000000)
+    expect(model.input).toEqual(['image'])
+    expect(view.container.textContent).toContain(text('modelSettingsSaved'))
+    view.unmount()
+  })
+
+  it('saves the selected subagent effort and writes the configured namespace key', async () => {
+    const view = renderEditor()
+    await settle()
+    const select = view.container.querySelectorAll('select')[1] as HTMLSelectElement
+    expect(select.value).toBe('high')
+    act(() => {
+      setValue(select, 'custom')
+    })
+    const custom = view.container.querySelector(`input[placeholder="${text('customPlaceholder')}"]`) as HTMLInputElement
+    act(() => {
+      setValue(custom, 'deep')
+    })
+    act(() => button(view.container, text('apply')).click())
+    await settle()
+    expect(view.mutate).toHaveBeenCalledWith('llm-pi-ai', [{ op: 'set', path: ['subagentEffort'], value: 'deep' }], 2)
+    expect(view.container.textContent).toContain(text('subagentSaved'))
+    view.unmount()
+  })
+
+  it('saves the subagent effort into the plugin section under the entry-config model', async () => {
+    const entry = entryConfigNamespace()
+    const view = renderEditor({
+      describe: async () => ({ ok: true, value: { namespaces: [namespace(), entry] } }),
+      mutate: async (ns, _ops, _revision) => ({
+        ok: true as const,
+        value: ns === 'thinking-effort'
+          ? entryConfigNamespace({ revision: 10, user: { subagentEffort: 'deep' }, value: { ...entry.value, subagentEffort: 'deep' } })
+          : namespace(),
+      }),
+    })
+    await settle()
+
+    const select = view.container.querySelectorAll('select')[1] as HTMLSelectElement
+    // The draft comes from the plugin's own section, not from `llm-pi-ai`.
+    expect(select.value).toBe('medium')
+    act(() => {
+      setValue(select, 'custom')
+    })
+    const custom = view.container.querySelector(`input[placeholder="${text('customPlaceholder')}"]`) as HTMLInputElement
+    act(() => {
+      setValue(custom, 'deep')
+    })
+    act(() => button(view.container, text('apply')).click())
+    await settle()
+
+    // The plugin section carries its own revision (9), not the llm-pi-ai one (2).
+    expect(view.mutate).toHaveBeenCalledWith('thinking-effort', [{ op: 'set', path: ['subagentEffort'], value: 'deep' }], 9)
+    expect(view.container.textContent).toContain(text('subagentSaved'))
+    view.unmount()
+  })
+
+  /**
+   * The subagent save and the OpenCode header toggle write the SAME section
+   * under the entry-config model, and 0.1.7 revisions are per section: the
+   * second write of any such pair has to carry the revision the first write's
+   * response reported, or the host refuses it as a conflict and the user has to
+   * reload. Each order reaches that section through a different code path —
+   * `entrySectionWrite` for the save, the OpenCode mutation for the toggle — so
+   * both are covered.
+   */
+  const entryWithToggle = (revision: number, effort: string, enabled: boolean): SettingsNamespace => entryConfigNamespace({
+    revision,
+    user: { subagentEffort: effort },
+    value: {
+      opencodeSession: { providers: { provider: { models: { 'model-a': enabled } } } },
+      subagentEffort: effort,
+    },
+  })
+
+  const headerSwitchOf = (container: HTMLElement): HTMLButtonElement => container.querySelector(
+    `[data-scope="opencode-session"] button[role="switch"][aria-label="${text('opencodeSessionHeaderTitle')}"]`,
+  ) as HTMLButtonElement
+
+  const saveSubagentEffort = async (view: ReturnType<typeof renderEditor>, effort: string): Promise<void> => {
+    const select = view.container.querySelectorAll('select')[1] as HTMLSelectElement
+    act(() => {
+      setValue(select, 'custom')
+    })
+    const custom = view.container.querySelector(`input[placeholder="${text('customPlaceholder')}"]`) as HTMLInputElement
+    act(() => {
+      setValue(custom, effort)
+    })
+    act(() => button(view.container, text('apply')).click())
+    await settle()
+  }
+
+  const toggleOpenCodeSession = async (view: ReturnType<typeof renderEditor>): Promise<void> => {
+    openFirstModel(view.container)
+    act(() => headerSwitchOf(view.container).click())
+    await settle()
+  }
+
+  it('sends the refreshed entry revision after a subagent save, then an OpenCode toggle', async () => {
+    const llm = openCodeLlmNamespace()
+    const entry = entryWithToggle(9, 'medium', false)
+    const responses = [entryWithToggle(10, 'deep', false), entryWithToggle(11, 'deep', true)]
+    const mutate = vi.fn<SettingsApi['mutate']>(async (ns) => {
+      // The same section both times; only the revision the caller sends differs.
+      expect(ns).toBe('thinking-effort')
+      return { ok: true as const, value: responses.shift()! }
+    })
+    const view = renderEditor({
+      namespaces: [entry],
+      describe: async () => ({ ok: true, value: { namespaces: [llm, entry] } }),
+      mutate,
+      compatibilityProfile: 'modern',
+    })
+    await settle()
+
+    await saveSubagentEffort(view, 'deep')
+    await toggleOpenCodeSession(view)
+
+    expect(view.mutate).toHaveBeenCalledTimes(2)
+    expect(view.mutate.mock.calls[0]?.[2]).toBe(9)
+    // The stale-revision defect: this used to send 9 again.
+    expect(view.mutate.mock.calls[1]?.[2]).toBe(10)
+    expect(view.mutate.mock.calls[1]?.[1]).toEqual([{
+      op: 'set',
+      path: ['opencodeSession', 'providers', 'provider', 'models', 'model-a'],
+      value: true,
+    }])
+    expect(view.container.querySelector('[role="alert"]')).toBeNull()
+    view.unmount()
+  })
+
+  it('sends the refreshed entry revision after an OpenCode toggle, then a subagent save', async () => {
+    const llm = openCodeLlmNamespace()
+    const entry = entryWithToggle(9, 'medium', false)
+    const responses = [entryWithToggle(10, 'medium', true), entryWithToggle(11, 'deep', true)]
+    const mutate = vi.fn<SettingsApi['mutate']>(async (ns) => {
+      expect(ns).toBe('thinking-effort')
+      return { ok: true as const, value: responses.shift()! }
+    })
+    const view = renderEditor({
+      namespaces: [entry],
+      describe: async () => ({ ok: true, value: { namespaces: [llm, entry] } }),
+      mutate,
+      compatibilityProfile: 'modern',
+    })
+    await settle()
+
+    await toggleOpenCodeSession(view)
+    await saveSubagentEffort(view, 'deep')
+
+    expect(view.mutate).toHaveBeenCalledTimes(2)
+    expect(view.mutate.mock.calls[0]?.[2]).toBe(9)
+    expect(view.mutate.mock.calls[1]?.[2]).toBe(10)
+    expect(view.mutate.mock.calls[1]?.[1]).toEqual([{ op: 'set', path: ['subagentEffort'], value: 'deep' }])
+    expect(view.container.querySelector('[role="alert"]')).toBeNull()
+    view.unmount()
+  })
+
+  // The subagent save and the OpenCode header toggle address the SAME section
+  // under the entry-config model, so the id alone cannot pick the failure copy:
+  // a failed subagent save must not be reported as a failed OpenCode session
+  // save. The write kind is the discriminator.
+  it('uses the generic write copy for a failed subagent save on an entry-config host', async () => {
+    const view = renderEditor({
+      describe: async () => ({ ok: true, value: { namespaces: [namespace(), entryConfigNamespace()] } }),
+      mutate: async () => ({ ok: false, error: { message: 'conflict' } }),
+    })
+    await settle()
+
+    const select = view.container.querySelectorAll('select')[1] as HTMLSelectElement
+    act(() => {
+      setValue(select, 'custom')
+    })
+    const custom = view.container.querySelector(`input[placeholder="${text('customPlaceholder')}"]`) as HTMLInputElement
+    act(() => {
+      setValue(custom, 'deep')
+    })
+    act(() => button(view.container, text('apply')).click())
+    await settle()
+
+    expect(view.mutate).toHaveBeenCalledWith('thinking-effort', [{ op: 'set', path: ['subagentEffort'], value: 'deep' }], 9)
+    const alert = view.container.querySelector('[role="alert"]')?.textContent ?? ''
+    expect(alert).toContain(text('writeError', { message: 'conflict' }))
+    expect(alert).not.toContain(text('opencodeSessionSaveFailed', { message: 'conflict' }))
+    view.unmount()
+  })
+
+  it('keeps the OpenCode-specific failure copy for the header toggle on an entry-config host', async () => {
+    const llm = openCodeLlmNamespace()
+    const entry = entryConfigNamespace({ revision: 21, value: { opencodeSession: { providers: { provider: { models: { 'model-a': false } } } } } })
+    const view = renderEditor({
+      namespaces: [entry],
+      describe: async () => ({ ok: true, value: { namespaces: [llm, entry] } }),
+      mutate: async () => ({ ok: false, error: { message: 'conflict' } }),
+      compatibilityProfile: 'modern',
+    })
+    await settle()
+
+    openFirstModel(view.container)
+    const headerSwitch = view.container.querySelector(`[data-scope="opencode-session"] button[role="switch"][aria-label="${text('opencodeSessionHeaderTitle')}"]`) as HTMLButtonElement
+    act(() => headerSwitch.click())
+    await settle()
+
+    expect(view.mutate).toHaveBeenCalledWith('thinking-effort', expect.any(Array), entry.revision)
+    const alert = view.container.querySelector('[role="alert"]')?.textContent ?? ''
+    expect(alert).toContain(text('opencodeSessionSaveFailed', { message: 'conflict' }))
+    view.unmount()
+  })
+
+  it('keeps the draft and shows a write failure after a rejected save', async () => {
+    const view = renderEditor({
+      mutate: async () => ({ ok: false, error: { message: 'conflict' } }),
+    })
+    await settle()
+    openFirstModel(view.container)
+    act(() => button(view.container, `${text('levelMinimal')}${text('levelSuffix')}`).click())
+    expect((view.container.querySelector('input[placeholder="' + text('wirePlaceholder') + '"]') as HTMLInputElement).value).toBe('minimal')
+    act(() => button(view.container, text('saveModelChanges')).click())
+    await settle()
+    expect(view.container.querySelector('[role="alert"]')?.textContent).toContain('conflict')
+    expect(view.container.querySelector('input[placeholder="' + text('wirePlaceholder') + '"]')).not.toBeNull()
+    expect(view.container.querySelector('[title="' + text('unsaved') + '"]')).not.toBeNull()
+    view.unmount()
+  })
+
+  it('applies presets, restores defaults, preserves drafts across collapse, and filters locales', async () => {
+    const view = renderEditor({ locales: ['zh', 'en'] })
+    await settle()
+    const language = view.container.querySelector('select') as HTMLSelectElement
+    expect([...language.options].map((option) => option.value)).toEqual(['zh', 'en'])
+    expect(view.container.textContent).toContain(`v${packageManifest.version}`)
+
+    act(() => button(view.container, text('quickSettings')).click())
+    act(() => button(view.container, text('presetOfficial')).click())
+    await settle()
+    expect(view.mutate).toHaveBeenCalled()
+
+    openFirstModel(view.container)
+    act(() => button(view.container, `${text('levelMinimal')}${text('levelSuffix')}`).click())
+    act(() => button(view.container, text('closeModelSettings')).click())
+    act(() => modelSettingsButton(view.container).click())
+    expect(view.container.querySelector('input[placeholder="' + text('wirePlaceholder') + '"]')).not.toBeNull()
+    act(() => button(view.container, text('restoreReasoning')).click())
+    await settle()
+    expect(view.container.textContent).toContain(text('restoreReasoning'))
+    view.unmount()
+  })
+})
+
+describe('ConfigBackupCard integration', () => {
+  it('mounts under the subagent card and exports the live configuration', async () => {
+    const download = vi.fn()
+    const view = renderEditor()
+    await settle()
+
+    const scope = view.container.querySelector('[data-scope="config-backup"]')
+    expect(scope).not.toBeNull()
+
+    const header = [...scope!.querySelectorAll('button')].find((candidate) => candidate.textContent?.includes(text('backupCardTitle')))
+    expect(header).not.toBeUndefined()
+    act(() => header!.click())
+    await settle()
+
+    const exportButton = [...scope!.querySelectorAll('button')].find((candidate) => candidate.textContent?.includes(text('backupExportCurrent')))
+    expect(exportButton).not.toBeUndefined()
+    view.unmount()
+  })
+
+  it('renders the card directly with an injected download so the export body is assertable', async () => {
+    const download = vi.fn()
+    const container = document.createElement('div')
+    document.body.append(container)
+    const root = createRoot(container)
+    const settings: SettingsApi = {
+      externalLanguages: false,
+      compatibilityProfile: 'modern',
+      // Both fixtures need a `user` layer: the snapshot captures the raw user
+      // section, and `openCodeNamespace()` defaults to `value` only.
+      describe: async () => ({
+        ok: true,
+        value: {
+          namespaces: [
+            openCodeLlmNamespace({ user: { subagentEffort: 'high' } }),
+            openCodeNamespace({ user: { opencodeSession: { providers: { provider: { models: { 'model-a': true } } } } } }),
+          ],
+        },
+      }),
+      mutate: vi.fn(async (ns, _ops, revision) => ({ ok: true as const, value: { ns, revision: revision + 1, value: {} } })),
+    }
+    act(() => {
+      root.render(<ConfigBackupCard settings={settings} palette={iosPalette()} t={text as Translation} download={download} onApplied={vi.fn()} />)
+    })
+    await settle()
+
+    const scope = container.querySelector('[data-scope="config-backup"]')!
+    act(() => [...scope.querySelectorAll('button')].find((candidate) => candidate.textContent?.includes(text('backupCardTitle')))!.click())
+    await settle()
+    act(() => [...scope.querySelectorAll('button')].find((candidate) => candidate.textContent?.includes(text('backupExportCurrent')))!.click())
+    await settle()
+
+    expect(download).toHaveBeenCalledTimes(1)
+    const body = JSON.parse((download.mock.calls[0] as [string, string])[1]) as { sections: Record<string, Record<string, unknown>> }
+    expect(body.sections['llm-pi-ai']).toEqual({ subagentEffort: 'high' })
+    expect(body.sections['dsh-thinking-effort']).toEqual({ opencodeSession: { providers: { provider: { models: { 'model-a': true } } } } })
+
+    act(() => root.unmount())
+    container.remove()
+  })
+})

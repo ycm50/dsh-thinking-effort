@@ -1,0 +1,391 @@
+# インストールガイド（公式 DSH CLI）
+
+このガイドでは DSH 公式の `dsh plugin` コマンドだけを使用します。コマンドは対象 profile に依存関係を追加し、`dsh.profile.bundles` を同期します。通常の `npm install`、profile 内での直接 `pnpm add`、profile マニフェストの手動編集で置き換えないでください。
+
+- [English installation guide](./INSTALL.md)
+- [中文安装指南](./INSTALL.zh.md)
+- [日本語インストールガイド](./INSTALL.ja.md)
+- [한국어 설치 안내](./INSTALL.ko.md)
+- [中国語 README](../README.md)
+- [Changelog](./CHANGELOG.md) · [日本語](./CHANGELOG.ja.md) · [한국어](./CHANGELOG.ko.md)
+
+このガイドで使用するプレースホルダー：
+
+- `<profile>`：変更対象の DSH profile。通常は `web`。
+- `${DSH_HOME}`：DSH home。既定値は `$HOME/.dsh`。
+- `@hytime/dsh-thinking-effort`：npm パッケージおよびランタイムプラグイン ID。
+- `thinking-effort`：Cordis composition と設定 Slot の ID。
+
+## 0. 前提条件と profile の確認
+
+```bash
+echo "DSH_HOME=${DSH_HOME:-$HOME/.dsh}"
+dsh --version
+ls "${DSH_HOME:-$HOME/.dsh}/profiles"
+```
+
+実行中の DSH プロセスが使用する profile を選択してください。`web` が一般的ですが、実際の `--profile` 引数が正式な指定です。
+
+公開パッケージの Host 入口は `lib/index.js`、Client 入口は `lib/client.js` です。TypeScript または locale のソースから開発する場合は、DSH の起動やパッケージ作成の前に `npm run build` を実行してください。
+
+現在の DSH には公開された semver metadata 契約がないため、実行時の capability detection を権威あるソースとします。任意のバージョンは明示的な metadata またはテスト入力がある場合だけ使用し、未知の有効なバージョンでも検出した能力に従って動作します。新しい `remote.settings` と旧来の `connection.api.settings` の両方に対応します。
+
+### DSH Runtime と Gateway Protocol と Settings モデルの互換境界
+
+これらは別々の互換レイヤーです。
+
+- **DSH Runtime：** Settings の transport は新しい DSH では `remote.settings`、古い DSH では `connection.api.settings` です。プラグインは実行時 capability を検出し、古い経路へのフォールバックをオプションとして扱います。
+- **Gateway Protocol：** DSH の schema が提供する場合、公式の `llm-pi-ai.compat` フィールドを使用します。オプションの `dsh-llm-openai-completions` transport をインストールして有効にすると、条件を満たすカスタム OpenAI 互換の思考プロバイダーを takeover できます。
+- **Settings model：** DSH `0.1.7` 以降は各 Loader エントリ自身の `Config` schema から設定フォームを導出し（`entry-config`）、設定ドキュメントを現在の profile の `cordis.patch.yml` に保存します。DSH `0.1.0-rc.7` から `0.1.6` までは namespace を登録する方式で、DSH 設定ドキュメント（例：`~/.dsh/settings.yaml`）に保存します。プラグインは両方をサポートし、Client は実行中の Host が公開するセクション ID（`entry-config` では `thinking-effort`、namespace モデルでは `dsh-thinking-effort`）を解決します。
+
+version-map はゲートウェイ capability を次のように判定します。
+
+| DSH 範囲 | Gateway compat フィールド | Takeover transport |
+| --- | --- | --- |
+| `0.1.0-rc.7` | 非対応 | 非対応 |
+| `0.1.0-rc.8` から `<0.1.2-alpha.1` | schema が公開する場合は対応。ただし `supportsFinishReason` と `supportsThinkingTokenBudget` はありません | オプション |
+| `0.1.2-alpha.1` 以降の対応範囲 | schema が公開する場合は 15 フィールドに対応 | オプション |
+
+DSH `0.1.0-rc.8` 以降の対応範囲では、フィールドの有無は実行時 schema の公開内容に従います。
+実行時 schema が公開しないフィールドは UI に表示されません。オプションの transport が未インストールまたは無効の場合、takeover は適用されません。
+
+## OpenCode セッション Header
+
+OpenCode セッション Header はモデル編集内のモデル単位の設定であり、provider 全体の設定ではありません。既定では無効です。対象の正確な `provider/model` を展開し、サービスが `x-opencode-session` を必要とする場合だけ **OpenCode セッション Header** を有効にしてください。トグルすると即保存され、別途保存ボタンはありません。
+
+### 既定で送られる値
+
+スイッチを有効にして `format` 未設定の場合、Host は OpenCode Zen の正規形を持ち**現在の DSH セッション ID から決定論的に導出**した `x-opencode-session` を送信します。
+
+| セグメント | 長さ | 由来 |
+| --- | --- | --- |
+| `ses_` | 4 | 固定プレフィックス |
+| 16 進タイムスタンプ | 12 | 48 ビットのミリ秒タイムスタンプ。DSH セッションごとに 1 回鋳造（`time: firstUse`） |
+| Base62 接尾辞 | 14 | セッション ID を正規化（`session-` プレフィックス除去、小文字化、ハイフン除去）した 80 ビット SHA-256 ダイジェスト |
+
+これにより得られる保証：
+
+- **セッション内で一定** — 同じ DSH セッションは常に同じ値を送信します（セッション単位のスティッキーキャッシュ）。キャッシュ淘汰時も初回鋳造は保持されるため、淘汰されたセッションを再訪しても同じ値になります。再開したセッションは同じ 14 桁の接尾辞を維持し、`firstUse` モードでは DSH 再起動後に 16 進タイムスタンプだけが再鋳造されます。
+- **セッション間で異なる** — 各 subagent 実行は独立した値を導出するため、複数の会話が 1 つの上流セッションに潰れません。
+- **DSH セッション ID に結び付く** — 同じセッション ID はどのマシンでも同じ接尾辞を導出し、保存値は不要です。
+- **形式準拠** — 結果は `^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`（計 30 文字）に一致します。
+
+### 生成器の設定
+
+生成器の場所は DSH の系統によって異なります。`0.1.7` 以降は現在の profile の `cordis.patch.yml` にある `opencodeSession.format` セクション（Loader エントリ ID `thinking-effort` で指定）です。`0.1.0-rc.7` から `0.1.6` までは DSH 設定ドキュメント（例：`~/.dsh/settings.yaml`）の `dsh-thinking-effort.opencodeSession.format` です。どちらの場所も設定ページが書き込みます。以下の YAML は `0.1.7` より前のリリースが読む namespace 形式を示します：
+
+```yaml
+dsh-thinking-effort:
+  opencodeSession:
+    providers:
+      opencode-go:
+        models:
+          deepseek-v4-flash: true
+    format:
+      mode: ses-derive
+      time: firstUse
+```
+
+フィールド：
+
+| フィールド | 値 | 既定 | 意味 |
+| --- | --- | --- | --- |
+| `mode` | `ses-derive` / `passthrough` / `template` / `expression` / `script` | `ses-derive` | スイッチ有効時に使う生成器。未知の値は `ses-derive` にフォールバックします。 |
+| `time` | `firstUse` / `hash` | `firstUse` | 12 桁の 16 進ブロックの由来。`hash` はセッションダイジェストから導出し、キャッシュなしでどのマシンでも値が完全に一致します。 |
+| `template` | 文字列 | `''` | `template` モード：プレースホルダー `{hex12}`、`{tail62}`、`{sessionId}`、`{rawSessionId}`、`{sha256}`、`{now}`、`{provider}`、`{model}`。 |
+| `expression` | 文字列 | `''` | `expression` モード：同じコンテキストを使う制限付き加算式。`sha256`、`slice`、`lower`、`upper` もあります。例：`'ses_' + hex12 + tail62`。 |
+| `script` | 絶対パス | `''` | `script` モード：`format(context)` をエクスポートし header 値を文字列で返す JS ファイル（`.mjs` / `.cjs`）。ファイル変更時にホットリロード（毎秒最大 1 回チェック）。読み込み・評価失敗時は `ses-derive` にフォールバックします。 |
+| `validate` | 正規表現ソース | `''` | 任意の検証。空なら検査しません。組み込みの既定形は `^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$` です。 |
+| `onInvalid` | `warn` / `drop` / `send` | `warn` | `validate` に失敗したとき：ログを出して送信 / header を省略 / 静かに送信。 |
+
+例：
+
+```yaml
+# 明示的な正規生成器（既定と等価）
+format: { mode: ses-derive, time: firstUse }
+
+# どのマシンでも完全に決定的（hex 部もダイジェスト由来）
+format: { mode: ses-derive, time: hash }
+
+# 旧動作：生の DSH セッション ID
+format: { mode: passthrough }
+
+# 上流の改版後のテンプレート
+format: { mode: template, template: '{hex12}-{tail62}' }
+
+# 上流が「プレフィックス + 派生部」を求める場合の式
+format: { mode: expression, expression: "'ses_' + hex12 + tail62" }
+
+# 任意の将来形式に対する外部スクリプト
+format: { mode: script, script: '/絶対/パス/session.mjs' }
+```
+
+`script` ファイルは同じコンテキストオブジェクトを受け取る関数をエクスポートします。
+
+```js
+// /絶対/パス/session.mjs
+export function format(ctx) {
+  // ctx.hex12, ctx.tail62, ctx.sessionId, ctx.rawSessionId, ctx.now, ctx.provider, ctx.model
+  return 'ses_' + ctx.hex12 + ctx.tail62
+}
+```
+
+`format` 設定を変更すると、セッションの次のリクエストで新しい設定に従って再導出されます（セッション単位のキャッシュは設定フィンガープリントがキーです）。Host またはプラグインパッケージを変更した後は DSH を再起動し、Settings または Client を変更した後は Web ページを更新してからモデル要求を確認してください。
+
+### セッション値ジェネレーターカード
+
+設定ページの**セッション値ジェネレーター**カードは、以下のすべてのフィールドを読み書きできるため、設定ドキュメントを手で書く必要はありません：生成モード、タイムスタンプの取得元、テンプレート / 式 / スクリプトのパス、検証用正規表現、検証失敗時の動作。カードは現在のモードで使うフィールドだけを表示し（タイムスタンプの取得元は `passthrough` 以外の 4 モードで表示されます）、モードを切り替えても他のフィールドに入力済みの内容は消えません。
+
+カードは書き込み前に検証し、通らない場合は**適用**ボタンを無効にします：
+
+- **検証用正規表現**は正しい正規表現でなければなりません。コンパイルできない正規表現について、ホストは**黙って「検証なし」にフォールバック**します。そのため「検証を設定したつもりで、実は設定されていない」という取り違えが最も起きやすい項目です。
+- **テンプレート / 式 / スクリプト**はそれぞれのモードで空にできません。空の場合、ホストは派生 `ses_` 値にフォールバックします。
+- **スクリプトのパス**は絶対パスでなければなりません。ホストは相対パスを自身の作業ディレクトリで解決するため、相対パスは実際には使えません。
+- **式**はカード内で構文検証されます（ホストと同じ解析コードを共有）。構文エラーに加え、存在しない識別子や関数を参照した場合も拒否されます。どちらも評価器が例外を投げ、ホストはその例外を同じく黙って派生値へのフォールバックに変換するためです。
+
+**適用**ボタンは変更したフィールドだけを書き込むため、同じ namespace にあるプロファイル一覧、読み込み前のバックアップ、モデルごとのセッションスイッチを上書きしません。
+
+### 動作の注意
+
+- アダプターまたは呼び出し元が既に指定した `x-opencode-session` は保持され、上書きされません。
+- この設定は新しい Remote Settings transport と旧来の `connection.api.settings` transport の両方で動作し、ルートの `api` プロトコルは変更しません。
+- リクエストが Sub2API、CPA、その他の転送ゲートウェイを通る場合は、`x-opencode-session` が保持され OpenCode 上流へ転送されることを確認してください。`llm-pi-ai.providers.<route>.headers.x-opencode-session` のような静的 route 設定は、全会話で同じ固定値を使うため代替になりません。
+
+## OpenCode user-agent 上書き
+
+`llm-pi-ai` アダプターは、すべての provider リクエストに独自の帰属 `user-agent`（`deepseek-harness/<バージョン> (+https://github.com/deepseek-ai/deepseek-harness)`）を強制し、同名の provider 設定値を削除します。そのため `llm-pi-ai.providers.<route>.headers.user-agent` は効果がありません。このプラグインは、一致する `llm/stream` リクエストで、送信直前の最後のレイヤーでヘッダーを書き換えます。これが唯一生き残る書き換えポイントです。
+
+上記の生成器と同じ設定セクションの `opencodeSession.userAgent` で設定し、既定では無効です。以下の YAML は `0.1.7` より前のリリースが読む namespace 形式を示します：
+
+```yaml
+dsh-thinking-effort:
+  opencodeSession:
+    userAgent:
+      value: "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
+      providers:
+        opencode-go:
+          enabled: true              # このルートの全モデル
+        sundrawnewapi-private:
+          value: "opencode/1.18.31"  # 任意のルート別値
+          models:
+            mimo-v2.5-free: true     # 正確なモデルのトグル
+```
+
+| フィールド | 意味 |
+| --- | --- |
+| `userAgent.value` | マスター値かつ有効スイッチ。空または欠落なら全体で無効です。 |
+| `userAgent.providers.<route>.enabled` | `true` でそのルートの全モデルに適用されます。 |
+| `userAgent.providers.<route>.models.<model>` | `true` でその正確なモデルだけに適用されます。 |
+| `userAgent.providers.<route>.value` | 任意のルート別値。非空ならマスター値より優先されます。 |
+
+1 リクエストの解決順：ルートが `enabled` または正確なモデルトグルで一致し、次に非空のルート別 `value`、なければマスター `value` を使います。一致しないリクエストは DSH の帰属 `user-agent` のままなので、明示的に選択したルートだけが影響を受けます。カスタム provider は設定済みのルート名をそのままキーに使え、追加登録は不要です。この上書きは同じリクエスト上のセッション Header と組み合わせられ、呼び出し元が明示指定した `user-agent` も上書きされます（アダプターを迂回するのが目的だからです）。
+
+Host またはプラグインパッケージを変更した後は DSH を再起動してください。設定自体は設定変更時に再読込されます。
+
+## ゲートウェイ互換設定
+
+Settings の provider グローバル領域では、その provider 配下のすべてのモデルの `compat` 既定値を編集します。モデルを 1 つ展開すると単一モデル領域が開きます。4 グループは既定で折りたたまれています。
+
+| グループ | boolean フィールド（`Auto` / 対応 / 非対応） | enum フィールド（`Auto` / 具体的な値） |
+| --- | --- | --- |
+| ロールと推論 | `supportsDeveloperRole`、`supportsReasoningEffort`、`supportsThinkingTokenBudget` | — |
+| 形式と出力 | `requiresThinkingAsText`、`requiresReasoningContentOnAssistantMessages` | `thinkingFormat`：`openai`、`openrouter`、`deepseek`、`together`、`baseten`、`zai`、`qwen`、`chat-template`、`qwen-chat-template`、`string-thinking`、`ant-ling`；`maxTokensField`：`max_tokens`、`max_completion_tokens` |
+| ストリーミングとツール | `supportsUsageInStreaming`、`supportsFinishReason`、`requiresToolResultName`、`requiresAssistantAfterToolResult`、`supportsStrictMode` | — |
+| 保存とキャッシュ | `supportsStore`、`supportsLongCacheRetention` | `cacheControlFormat`：`anthropic` |
+
+プロトコルの対応範囲は、DSH バージョンと実行時 schema による上限に加わる制限です。
+
+| ルートの `api` | このプラグインの 15 個のスカラーから設定できるフィールド |
+| --- | --- |
+| `openai-completions` | 15 フィールドすべて |
+| `openai-responses`、`azure-openai-responses`、`openai-codex-responses` | `supportsDeveloperRole`、`supportsStrictMode`、`supportsLongCacheRetention` |
+| `anthropic-messages` | `supportsLongCacheRetention` |
+| `bedrock-converse-stream` | `supportsStrictMode` |
+
+認識されたプロトコルでは、一覧にないフィールドは UI に表示されず、書き込まれません。`api` がない、または認識できない場合は、実行時 schema と DSH の検証を最終的な基準にします。
+
+カタログモデルと `models[]` エントリの両方で compat を編集できます。前者は `modelOverrides.<model>.compat`、後者は `models[].compat` を使用します。
+
+```yaml
+providers:
+  qwen-gateway:
+    compat:
+      supportsDeveloperRole: false
+      maxTokensField: max_tokens
+    models:
+      - id: qwen-plus
+      - id: qwen-thinking
+        compat:
+          maxTokensField: max_completion_tokens
+```
+
+フィールドごとに独立して、model → provider → base/catalog → protocol の順で解決されます。URL/hostname は compat のソースとして使用しません。モデルの値はそのフィールドだけを上書きします。`Auto` は現在の層の値を削除して provider の継承を復元し、チェーンの次の値を有効にします。provider の既定値はそのルートの全モデルに適用され、モデルの変更は現在のモデルだけに反映されます。同じルート（provider）では、非空の `models[]` と非空の `modelOverrides` は併用できません。公式 schema はこの無効な設定を拒否し、プラグインは異常なデータに対して fail closed します。
+
+現在の DSH Settings API は配列インデックスの path op に対応していません。そのため `modelOverrides` の編集はフィールド単位の `set`/`unset` を使い、選択したフィールドだけを変更します。`models[]` の保存は `providers.<route>.models` 全体を 1 回の配列 set で書き戻し、他のモデル、未知フィールド、他の compat フィールドを保持します。実行時 schema が公開しないフィールドは表示されません。これらの値はコントロールプレーン設定だけで、ネットワーク要求は外部 transport が担当します。
+
+### スナップショット読み込みの信頼モデル
+
+スナップショットには、推論強度、compat スイッチ、セッション Header を有効にするモデルなどの**capability 設定**が含まれており、マシン間で安全に移行できます。書き出したファイルには**デプロイ環境の接続設定**もそのまま含まれます。provider の `baseURL`、`apiKeyEnv`、`headers` と `opencodeSession.format.script` がそれにあたります。読み込み時にはこれらのフィールドが既定で保留されるため、他人から受け取ったファイルによってリクエスト先を変更されたり、相手の認証情報名を設定されたり、生の Header を注入されたり、Host が import して実行するローカルモジュールを指定されたりすることはありません。ただし、書き出したファイルは `headers` に置いた平文トークンを含め、すべての値をそのまま保持しています。共有する前に必ず内容を確認してください。
+
+ファイルが接続設定の変更を試みると、プレビューにスキップした項目数が表示され、**Also import endpoints and credentials (advanced)** が提示されます。この項目は毎回オフで、前回の選択は記憶されません。警告には影響を受ける各 route の接続先が表示されるため、同意する前に送信先を確認できます。
+
+ロールバック用コピーの復元や保存済みプロファイルの適用も同じルールに従います。以前 opt-in で接続設定を読み込み、古い endpoint を復元する必要がある場合は、そのプレビューで再度チェックしてください。
+
+## 1. 公式インストール
+
+最新版をインストールします。
+
+```bash
+dsh plugin --profile <profile> add @hytime/dsh-thinking-effort
+```
+
+今回のリリースを明示してインストールします。
+
+```bash
+dsh plugin --profile <profile> add @hytime/dsh-thinking-effort@0.4.0
+```
+
+公式 CLI は profile の依存関係、lockfile、`dsh.profile.bundles` を自動的に更新します。YAML の行を手動で追加しないでください。
+
+## 2. 更新
+
+registry の最新版へ更新します。
+
+```bash
+dsh plugin --profile <profile> update @hytime/dsh-thinking-effort
+```
+
+特定バージョンへ更新する場合：
+
+```bash
+dsh plugin --profile <profile> add @hytime/dsh-thinking-effort@0.4.0
+```
+
+Host の変更には DSH を再起動し、Client の変更には Web ページを更新してください。
+
+## 3. 旧パッケージからの移行
+
+古いインストールには次の依存関係が残っていることがあります。
+
+```text
+dsh-thinking-effort
+github:hytime/dsh-thinking-effort
+```
+
+古い依存関係が残っている場合は公式コマンドを使います。
+
+```bash
+dsh plugin --profile <profile> remove dsh-thinking-effort
+dsh plugin --profile <profile> add @hytime/dsh-thinking-effort@0.4.0
+```
+
+依存関係は別のツールで削除済みですが、古い bundle が残っている場合は次で composition を確認します。
+
+```bash
+dsh --profile <profile> --dump-default-config
+```
+
+`name: dsh-thinking-effort` が残っている場合は profile lockfile から古い GitHub commit を確認し、公式 CLI で再調整します。
+
+```bash
+dsh plugin --profile <profile> add github:hytime/dsh-thinking-effort#<old-commit>
+dsh plugin --profile <profile> remove dsh-thinking-effort
+dsh plugin --profile <profile> add @hytime/dsh-thinking-effort@0.4.0
+```
+
+新しい bundle リストに旧パッケージ名を追加しないでください。
+
+## 4. インストールの検証
+
+依存関係とバージョンを確認します。
+
+```bash
+grep -n "@hytime/dsh-thinking-effort" \
+  "${DSH_HOME:-$HOME/.dsh}/profiles/<profile>/package.json"
+node -p "require('${DSH_HOME:-$HOME/.dsh}/profiles/<profile>/node_modules/@hytime/dsh-thinking-effort/package.json').version"
+```
+
+このリリースではバージョンが `0.4.0` である必要があります。
+
+## 日本語と韓国語の対応状況
+
+DSH `0.1.2-alpha.1` 以降は `LocaleRuntime` の language-pack 拡張をサポートします。このプラグインは `ja` と `ko` を動的に登録するため、DSH の fork は不要です。組み込み locale ID だけを受け付ける古い DSH では `zh` と `en` のみ使用できます。
+
+
+公式 composition を確認します。
+
+```bash
+dsh --profile <profile> --dump-default-config
+```
+
+次の行が含まれている必要があります。
+
+```yaml
+- id: thinking-effort
+  name: '@hytime/dsh-thinking-effort'
+```
+
+次の旧 bundle 行は含まれてはいけません。
+
+```yaml
+name: dsh-thinking-effort
+```
+
+## 5. 設定ページの確認
+
+DSH を再起動し、Web ページを更新してから **Settings → Model capabilities and effort** を開きます。
+
+1. DSH `0.1.2-alpha.1` 以降では、言語セレクターに `中文`、`English`、`日本語`、`한국어` が表示されます。組み込み locale ID だけを受け付ける古い DSH では `中文` と `English` のみ使用できます。
+2. **Subagent default effort** カードに現在の既定値と **Apply** が表示されます。
+3. **Quick settings** から公式 DeepSeek 形式または汎用プリセットを一括適用できます。
+4. プロバイダー/モデル一覧では検索、展開/折りたたみ、入力能力、コンテキスト長、モデル設定ボタンを確認できます。
+5. 右下のバージョン表示に、インストール済みプラグインのバージョンが表示されます。
+
+Host のロードマーカーは次で確認できます。
+
+```bash
+cat "${DSH_HOME:-$HOME/.dsh}/thinking-effort-loaded.json"
+```
+
+## 6. トラブルシューティング
+
+| 症状 | 対応 |
+| --- | --- |
+| `dsh` が見つからない | 公式 DSH CLI をインストールまたは有効化してください。npm や pnpm で profile インストールを代用しないでください。 |
+| `dump-default-config` に旧パッケージが表示される | 旧 lockfile commit を復元し、公式 remove を実行してから scoped パッケージを追加します。 |
+| Host プラグインがロードされない | DSH を再起動し、`thinking-effort-loaded.json` と起動ログを確認します。 |
+| 設定ページが表示されない | DSH を再起動し、ページを更新して scoped bundle の composition を確認します。 |
+| 言語選択が保存されない | DSH locale service が mount され、profile に設定を書き込めることを確認します。 |
+| 推論強度の書き込みに失敗する | `off` 以外のすべてのレベルにゲートウェイ値が必要です。 |
+| `UNSUPPORTED_REASONING_EFFORT` が返る | 対象モデルが対応するレベルを選ぶか、プロバイダーの既定値へ戻します。 |
+
+## リリースのメンテナンス
+
+メンテナーは `package.json` の version と該当する `CHANGELOG` を更新してコミットし、一致する `v<version>` tag を作成します。tag の指す commit は `main` の履歴に含まれている必要があります。`publish.yml` workflow は version や CHANGELOG を自動変更しません。
+
+npm パッケージには GitHub Trusted Publishing を設定してください。リポジトリは `hytime/dsh-thinking-effort`、workflow は `publish.yml` です。公開は GitHub OIDC と provenance を使い、`npm publish --provenance --access public` を実行します。`NPM_TOKEN` や長期 token は使用しません。npm に同じ version が存在する場合、公開は停止します。
+
+公開前に workflow は rc7 → rc2 → alpha2 → namespace → entry の順で、5 つの一時的な公式 DSH capability representative checkout を作成します。公式 `dsh plugin` コマンドで現在の tarball をインストールしてから、実際の互換性テストを実行します。
+
+- `dsh-v0.1.0-rc.7`（`0.1.0-rc.7`）— rc7 capability representative
+- `dsh-v0.1.1-rc.2`（`0.1.1-rc.2`）— rc2 capability representative
+- `dsh-v0.1.3-alpha.2`（`0.1.3-alpha.2`）— alpha2 capability representative
+- `dsh-v0.1.6-alpha.1`（`0.1.6-alpha.1`）— 最新の namespace モデル capability representative（実ブラウザ DOM プローブを実行）
+- `dsh-v0.1.7-alpha.1`（`0.1.7-alpha.1`）— entry-config capability representative（設定フォームは各 Loader エントリ自身の `Config` から導出。実ブラウザ DOM プローブも実行）
+
+通常の CI はテスト専用で、Pull Request と `main` への push で実行されます。`npm ci` を使うため、依存関係変更時は `package-lock.json` をコミットしてください。
+
+## 7. 削除
+
+公式コマンドを使用します。
+
+```bash
+dsh plugin --profile <profile> remove @hytime/dsh-thinking-effort
+rm -f "${DSH_HOME:-$HOME/.dsh}/thinking-effort-loaded.json"
+```
+
+profile composition に scoped bundle が残っていないことを確認します。
+
+```bash
+dsh --profile <profile> --dump-default-config
+```

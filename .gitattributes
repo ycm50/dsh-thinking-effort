@@ -1,0 +1,19 @@
+# Repository-wide line-ending contract.
+#
+# The documentation contract tests in `tests/loader-composition.test.ts` compare
+# exact document text, and the published package must be byte-stable across
+# platforms, so tracked text files are always stored AND checked out with LF.
+# Without this file a Windows checkout with `core.autocrlf=true` (the git
+# default there) rewrites every document to CRLF and those contracts fail.
+* text=auto eol=lf
+
+# Binary assets keep their bytes exactly as committed.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.zip binary
+*.gz binary
+*.tgz binary

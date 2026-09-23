@@ -1,0 +1,279 @@
+import { describe, expect, it } from 'vitest'
+import { ALPHA1_PLUS_COMPAT_FIELDS, RC8_COMPAT_FIELDS } from '../src/compat/gateway/fields.ts'
+import { clientCapabilities, hostCapabilities } from '../src/compat/capabilities.ts'
+import { capabilitiesForVersion, settingsModelForVersion, takeoverSupportedForVersion, takeoverTransportForVersion } from '../src/compat/version-map.ts'
+import { resolveCompatibility } from '../src/compat/version-adapter.ts'
+
+const legacy = { settings: 'legacy', externalLanguages: false } as const
+const modern = { settings: 'remote', externalLanguages: true } as const
+const noSettings = { settings: 'none', externalLanguages: false } as const
+
+const rc7Capabilities = {
+  settingsTransport: 'legacy',
+  settingsApi: 'connection.api.settings',
+  settingsModel: 'namespace',
+  baseModelFields: ['reasoningEfforts'],
+  gatewayCompatFields: [],
+  externalLanguages: false,
+  takeoverTransport: 'unsupported',
+} as const
+
+const rc8Capabilities = {
+  settingsTransport: 'legacy',
+  settingsApi: 'connection.api.settings',
+  settingsModel: 'namespace',
+  baseModelFields: ['reasoningEfforts', 'input', 'contextWindow'],
+  gatewayCompatFields: [...RC8_COMPAT_FIELDS],
+  externalLanguages: false,
+  takeoverTransport: 'optional',
+} as const
+
+const modernCapabilities = {
+  settingsTransport: 'modern',
+  settingsApi: 'remote.settings',
+  settingsModel: 'namespace',
+  baseModelFields: ['reasoningEfforts', 'input', 'contextWindow'],
+  gatewayCompatFields: [...ALPHA1_PLUS_COMPAT_FIELDS],
+  externalLanguages: true,
+  takeoverTransport: 'optional',
+} as const
+
+/**
+ * The `0.1.7` line keeps every transport fact and swaps the settings model:
+ * forms come from each Loader entry's Config, so no namespace is registered.
+ */
+const entryConfigCapabilities = {
+  ...modernCapabilities,
+  settingsModel: 'entry-config',
+} as const
+
+describe('version capability map', () => {
+  it('returns the complete rc7 capability matrix', () => {
+    expect(capabilitiesForVersion('0.1.0-rc.7')).toEqual(rc7Capabilities)
+  })
+
+  it('returns the complete rc8 legacy capability matrix', () => {
+    expect(capabilitiesForVersion('0.1.0-rc.8')).toEqual(rc8Capabilities)
+  })
+
+  it('returns the complete modern capability matrix', () => {
+    expect(capabilitiesForVersion('0.1.3-alpha.2')).toEqual(modernCapabilities)
+  })
+
+  it('exposes takeover availability from the mapped capability ranges', () => {
+    expect(takeoverTransportForVersion('0.1.0-rc.7')).toBe('unsupported')
+    expect(takeoverSupportedForVersion('0.1.0-rc.7')).toBe(false)
+    expect(takeoverTransportForVersion('0.1.1-rc.2')).toBe('optional')
+    expect(takeoverTransportForVersion('0.1.3-alpha.2')).toBe('optional')
+    expect(takeoverTransportForVersion('0.1.3')).toBe('optional')
+    expect(takeoverSupportedForVersion('bad')).toBe(false)
+  })
+
+  it('maps the newest published DSH release inside the modern window', () => {
+    expect(capabilitiesForVersion('0.1.5-rc.1')).toEqual(modernCapabilities)
+    expect(capabilitiesForVersion('0.1.5-rc.2')).toEqual(modernCapabilities)
+    expect(takeoverTransportForVersion('0.1.5-rc.2')).toBe('optional')
+    expect(capabilitiesForVersion('0.1.6-alpha.1')).toEqual(modernCapabilities)
+    expect(takeoverTransportForVersion('0.1.6-alpha.1')).toBe('optional')
+  })
+
+  it('maps the 0.1.7 settings rewrite as its own window', () => {
+    expect(capabilitiesForVersion('0.1.7-alpha.1')).toEqual(entryConfigCapabilities)
+    expect(takeoverTransportForVersion('0.1.7-alpha.1')).toBe('optional')
+    expect(capabilitiesForVersion('0.1.7')).toEqual(entryConfigCapabilities)
+    expect(settingsModelForVersion('0.1.7-alpha.1')).toBe('entry-config')
+    expect(settingsModelForVersion('0.1.6-alpha.2')).toBe('namespace')
+  })
+
+  it('keeps every half-open boundary and accepts semver build metadata', () => {
+    expect(capabilitiesForVersion('0.1.0-rc.6')).toBeUndefined()
+    expect(capabilitiesForVersion('0.1.0-rc.7+ci.1')).toEqual(rc7Capabilities)
+    expect(capabilitiesForVersion('0.1.0-rc.8+ci.1')).toEqual(rc8Capabilities)
+    expect(capabilitiesForVersion('0.1.2-alpha.0+ci.1')).toEqual(rc8Capabilities)
+    expect(capabilitiesForVersion('0.1.2-alpha.1+ci.1')).toEqual(modernCapabilities)
+    expect(capabilitiesForVersion('0.1.2-alpha.0-foo')).toEqual(modernCapabilities)
+    expect(capabilitiesForVersion('0.1.2+build.7')).toEqual(modernCapabilities)
+    expect(capabilitiesForVersion('0.1.3-0+build.7')).toEqual(modernCapabilities)
+    expect(capabilitiesForVersion('0.1.3-0')).toEqual(modernCapabilities)
+    expect(capabilitiesForVersion('0.1.3')).toEqual(modernCapabilities)
+    expect(capabilitiesForVersion('0.1.5-rc.2+ci.1')).toEqual(modernCapabilities)
+    expect(capabilitiesForVersion('0.1.6-alpha.1')).toEqual(modernCapabilities)
+    expect(capabilitiesForVersion('0.1.6')).toEqual(modernCapabilities)
+    expect(capabilitiesForVersion('0.1.6-alpha.2')).toEqual(modernCapabilities)
+    expect(capabilitiesForVersion('0.1.7-0')).toEqual(entryConfigCapabilities)
+    expect(capabilitiesForVersion('0.1.7-alpha.1+ci.1')).toEqual(entryConfigCapabilities)
+    expect(capabilitiesForVersion('0.1.8-0')).toBeUndefined()
+    expect(capabilitiesForVersion('0.2.0')).toBeUndefined()
+  })
+
+  it('carries the complete mapped matrix in compatibility reports', () => {
+    expect(resolveCompatibility({ version: '0.1.0-rc.7', capabilities: legacy }).versionCapabilities)
+      .toEqual(rc7Capabilities)
+    expect(resolveCompatibility({ version: '0.1.0-rc.8', capabilities: legacy }).versionCapabilities)
+      .toEqual(rc8Capabilities)
+    expect(resolveCompatibility({ version: '0.1.3-alpha.2+build.7', capabilities: modern }).versionCapabilities)
+      .toEqual(modernCapabilities)
+  })
+
+  it('reports the newest published DSH release as the mapped modern profile', () => {
+    const report = resolveCompatibility({ version: '0.1.6-alpha.1', capabilities: modern })
+
+    expect(report.profile).toBe('modern')
+    expect(report.expected).toBe('modern')
+    expect(report.versionCapabilities).toEqual(modernCapabilities)
+    expect(report.diagnostics).toHaveLength(0)
+  })
+})
+
+describe('compatibility profiles', () => {
+  it('classifies compatibility ranges without enumerating every release', () => {
+    const legacyRange = resolveCompatibility({ version: '0.1.1-rc.99', capabilities: modern })
+    expect(legacyRange.profile).toBe('modern')
+    expect(legacyRange.expected).toBe('legacy')
+
+    const modernRange = resolveCompatibility({ version: '0.1.2-alpha.99', capabilities: legacy })
+    expect(modernRange.profile).toBe('legacy')
+    expect(modernRange.expected).toBe('modern')
+
+    const unknownFuture = resolveCompatibility({ version: '0.2.0', capabilities: legacy })
+    expect(unknownFuture.profile).toBe('legacy')
+    expect(unknownFuture.expected).toBeUndefined()
+    expect(unknownFuture.versionCapabilities).toBeUndefined()
+    expect(unknownFuture.diagnostics).toHaveLength(0)
+  })
+
+  it('uses detected capabilities when version metadata is absent', () => {
+    expect(resolveCompatibility({ version: undefined, capabilities: modern }).profile).toBe('modern')
+    expect(resolveCompatibility({ version: undefined, capabilities: legacy }).profile).toBe('legacy')
+    expect(resolveCompatibility({ version: undefined, capabilities: noSettings }).profile).toBe('unknown')
+  })
+
+  it('uses actual capabilities for an unknown valid modern version', () => {
+    const report = resolveCompatibility({ version: '9.9.9', capabilities: modern })
+
+    expect(report.profile).toBe('modern')
+    expect(report.expected).toBeUndefined()
+    expect(report.versionCapabilities).toBeUndefined()
+    expect(report.capabilities).toEqual(modern)
+    expect(report.diagnostics).toHaveLength(0)
+  })
+
+  it('uses actual capabilities for an unknown valid legacy version', () => {
+    const report = resolveCompatibility({ version: '9.9.9', capabilities: legacy })
+
+    expect(report.profile).toBe('legacy')
+    expect(report.expected).toBeUndefined()
+    expect(report.diagnostics).toHaveLength(0)
+  })
+  it('treats malformed version metadata as unknown without throwing', () => {
+    const report = resolveCompatibility({ version: '0.1', capabilities: legacy })
+
+    expect(report.profile).toBe('unknown')
+    expect(report.version).toBe('0.1')
+    expect(report.expected).toBeUndefined()
+    expect(report.versionCapabilities).toBeUndefined()
+    expect(report.diagnostics).toEqual([
+      expect.objectContaining({ code: 'invalid-version', version: '0.1' }),
+    ])
+  })
+
+  it('uses actual capabilities and reports a modern-version mismatch', () => {
+    const report = resolveCompatibility({ version: '0.1.2-alpha.1', capabilities: legacy })
+
+    expect(report.profile).toBe('legacy')
+    expect(report.expected).toBe('modern')
+    expect(report.diagnostics).toHaveLength(1)
+    expect(report.diagnostics[0]).toMatchObject({
+      code: 'version-capability-mismatch',
+      expectedProfile: 'modern',
+      actualCapabilities: legacy,
+    })
+    expect(report.versionCapabilities).toEqual(modernCapabilities)
+  })
+
+  it('uses actual capabilities and reports a legacy-version mismatch', () => {
+    const report = resolveCompatibility({ version: '0.1.0-rc.7', capabilities: modern })
+
+    expect(report.profile).toBe('modern')
+    expect(report.expected).toBe('legacy')
+    expect(report.diagnostics).toHaveLength(1)
+    expect(report.diagnostics[0]).toMatchObject({
+      expectedProfile: 'legacy',
+      actualCapabilities: modern,
+    })
+  })
+
+  it('reports missing capabilities as a mismatch without throwing', () => {
+    const report = resolveCompatibility({ version: '0.1.2-alpha.1', capabilities: noSettings })
+
+    expect(report.profile).toBe('unknown')
+    expect(report.diagnostics).toHaveLength(1)
+    expect(report.diagnostics[0]).toMatchObject({
+      expectedProfile: 'modern',
+      actualCapabilities: noSettings,
+    })
+  })
+
+  it('does not use external language support to choose a profile', () => {
+    expect(resolveCompatibility({
+      version: undefined,
+      capabilities: { settings: 'remote', externalLanguages: false },
+    }).profile).toBe('modern')
+  })
+})
+
+describe('client capability reader', () => {
+  it('prefers a complete Remote settings API without calling methods', () => {
+    let calls = 0
+    const remoteSettings = {
+      describe: () => { calls += 1 },
+      mutate: () => { calls += 1 },
+    }
+    const addLanguage = () => { calls += 1 }
+
+    expect(clientCapabilities({ remoteSettings, addLanguage })).toEqual(modern)
+    expect(calls).toBe(0)
+  })
+
+  it('recognizes Remote settings methods exposed through accessors', () => {
+    const remoteSettings = {}
+    Object.defineProperties(remoteSettings, {
+      describe: { enumerable: true, get: () => () => undefined },
+      mutate: { enumerable: true, get: () => () => undefined },
+    })
+
+    expect(clientCapabilities({ remoteSettings })).toEqual({ settings: 'remote', externalLanguages: false })
+  })
+  it('falls back to complete legacy settings when Remote is unavailable', () => {
+    expect(clientCapabilities({
+      remoteSettings: { describe() {} },
+      legacySettings: { describe() {}, mutate() {} },
+    })).toEqual(legacy)
+  })
+
+  it('returns no Settings for incomplete APIs and only accepts a function addLanguage', () => {
+    expect(clientCapabilities({
+      remoteSettings: { describe() {} },
+      legacySettings: { mutate() {} },
+      addLanguage: {},
+    })).toEqual(noSettings)
+  })
+})
+
+describe('host capability reader', () => {
+  it('recognizes only the declared Host Settings shape', () => {
+    expect(hostCapabilities({
+      settings: {
+        get() {},
+        update() {},
+        describe() {},
+        writable: true,
+        undeclared: 'ignored',
+      },
+    })).toEqual(legacy)
+  })
+
+  it('does not infer Host capabilities from undeclared properties', () => {
+    expect(hostCapabilities({ settings: { writable: true } })).toEqual(noSettings)
+  })
+})

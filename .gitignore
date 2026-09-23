@@ -1,0 +1,28 @@
+node_modules/
+# Build output. `lib/types/` holds the compiler's intermediate output — the
+# JavaScript, source maps and copied locale JSON that `tsdown` consumes — and
+# stays untracked. The published subset (`lib/index.js`, `lib/client.js`,
+# `lib/types/**/*.d.ts`) is committed instead: DSH installs this repository
+# straight from git, and a git install runs no build of its own, so a package
+# without those entries composes but never activates.
+lib/types/**/*.js
+lib/types/**/*.js.map
+lib/types/**/*.json
+*.tgz
+*.log
+.pnpm-store/
+AGENTS.md
+docs/superpowers/
+.worktrees/
+
+# Swift Package Manager's build cache, written beside the checkout by a local
+# build; it is tool state, not part of the package (a `git add -A` would
+# otherwise commit a CACHEDIR.TAG and a debug marker).
+.build/
+
+# Local runtime and manual-test artifacts.
+thinking-effort-loaded.json
+pnpm-lock.yaml
+docs/68d52d9f-5742-4164-9685-6b9e7f5a86e9.png
+docs/94d15cfd-3ff0-4695-ac9f-c10cb578b500.png
+.superpowers/

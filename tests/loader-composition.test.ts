@@ -1,0 +1,2103 @@
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { basename, join, resolve } from 'node:path'
+import { createRequire } from 'node:module'
+import { pathToFileURL } from 'node:url'
+import { runInNewContext } from 'node:vm'
+import { settingsBridge } from '../src/client/settings-bridge.js'
+import { inventoryFrom } from '../src/client/model-inventory.js'
+import { opsForModelArrayCompat } from '../src/client/model-ops.js'
+import { editableProviderCompatFields, schemaNodeAtPath } from '../src/compat/gateway/validation.js'
+import { PLUGIN_ENTRY_ID } from '../src/compat/settings-model.js'
+import type { SettingsModel } from '../src/compat/settings-model.js'
+import { capabilitiesForVersion } from '../src/compat/version-map.js'
+import {
+  identifyTakeoverProviders,
+  isCustomOpenAiGateway,
+  resolveTakeoverProviders,
+  takeoverProvidersOf,
+} from '../src/compat/gateway/takeover.js'
+import { opsForProviderCompat } from '../src/compat/gateway/ops.js'
+import {
+  digestTail62 as digestTail62ForLoaderProbe,
+  normalizeSessionId as normalizeSessionIdForLoaderProbe,
+} from '../src/host/opencode-session-format.js'
+import { afterAll, describe, expect, it } from 'vitest'
+
+type PackageManifest = {
+  readonly name?: string
+  readonly version: string
+  readonly main?: string
+  readonly types?: string
+  readonly exports: Record<string, string | { readonly types?: string; readonly default?: string }>
+  readonly files: readonly string[]
+  readonly dsh?: { readonly client?: { readonly inject?: readonly string[]; readonly platform?: string; readonly external?: readonly string[] } }
+}
+
+/**
+ * The subset of one `settings/describe` entry-config row this suite reads. The
+ * host's wire view is `SettingsNamespaceView`; only these fields are asserted,
+ * and `user` is the raw layer a path write merges into.
+ *
+ * `schema` stays `unknown` because the host publishes
+ * `Schema.prototype.toJSON()`, whose `{ uid, refs }` envelope has no top-level
+ * `dict` — {@link entryFormFields} resolves it.
+ */
+type EntryConfigNamespaceView = {
+  readonly ns?: string
+  readonly revision?: number
+  readonly schema?: unknown
+  readonly value?: Record<string, unknown>
+  readonly user?: Record<string, unknown>
+}
+
+/**
+ * The field names one published entry-config form declares, sorted.
+ *
+ * `describe` publishes `schema: form.toJSON()`, and that envelope puts the root
+ * node at `refs[String(uid)]`, so `schema.dict` is always empty on the wire and
+ * the shared `schemaNodeAtPath` accessor is the only correct read.
+ */
+function entryFormFields(schema: unknown): string[] {
+  const dict = schemaNodeAtPath(schema, [])?.dict
+  if (typeof dict !== 'object' || dict === null || Array.isArray(dict)) return []
+  return Object.keys(dict).sort()
+}
+
+const root = resolve(import.meta.dirname, '..')
+const integrationEnabled = process.env.DSH_LOADER_INTEGRATION === '1'
+
+function parseCliRoots(raw: string): string[] {
+  const values = raw.split(',').map((value) => value.trim())
+  if (values.length !== 5 || values.some((value) => value === '')) {
+    throw new Error('DSH_CLI_ROOTS must contain exactly five non-empty comma-separated roots: rc7, rc2, alpha2, namespace, entry-config')
+  }
+  const roots = values.map((value) => realpathSync(value))
+  if (new Set(roots).size !== 5) {
+    throw new Error('DSH_CLI_ROOTS must contain five distinct roots')
+  }
+  return roots
+}
+
+function readOfficialDshVersion(cliRoot: string): string {
+  const manifestPath = resolve(cliRoot, 'package.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { version?: unknown }
+  if (typeof manifest.version !== 'string' || manifest.version === '') {
+    throw new Error(`official DSH root manifest has no version: ${manifestPath}`)
+  }
+  return manifest.version
+}
+
+const expectedOfficialDshVersions = [
+  '0.1.0-rc.7',
+  '0.1.1-rc.2',
+  '0.1.3-alpha.2',
+  '0.1.6-alpha.1',
+  '0.1.7-alpha.1',
+] as const
+
+/**
+ * Poll `read` until it answers something other than `undefined`, then return
+ * that. The provider-defaults fill is driven by the `settings/document-updated`
+ * event that the write triggering it raises, so no test can observe the result
+ * in the same turn as the write.
+ */
+async function waitForFill<T>(read: () => Promise<T | undefined>, timeoutMs = 20000): Promise<T> {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    const value = await read()
+    if (value !== undefined) return value
+    if (Date.now() > deadline) throw new Error(`timed out after ${timeoutMs}ms waiting for the provider-defaults fill`)
+    await new Promise<void>((resolveWait) => setTimeout(resolveWait, 250))
+  }
+}
+
+const loaderSeedProvider = {
+  api: 'openai-completions',
+  baseURL: 'http://gateway.test/v1',
+  models: [
+    { id: 'loader-model-a', reasoningEfforts: { off: null, high: 'high' }, custom: 'keep-a' },
+    { id: 'loader-model-b', reasoningEfforts: { off: null, high: 'high' }, custom: 'keep-b', compat: { maxTokensField: 'max_tokens', supportsStore: true } },
+  ],
+} as const
+
+const officialSeedCompatFields = new Set(['maxTokensField', 'supportsStore'])
+
+const localizedNavigationLabels = {
+  continue: /^(继续|Continue)$/,
+  configureLater: /^(稍后配置|Configure later)$/,
+  chooseWorkspace: /^(选择工作区|Choose workspace)$/,
+  settings: /^(设置|Settings)$/,
+  plugins: /^(插件|Plugins)$/,
+} as const
+
+/**
+ * The titles this plugin's settings section renders under, one per shipped
+ * locale. The real-browser probe uses them both to decide whether it still has
+ * to expand a navigation group and to report whether the section is on screen.
+ */
+const thinkingEffortSectionTitles = [
+  '模型能力与档位',
+  'Model capabilities and effort',
+  'モデルの能力と推論強度',
+  '모델 기능 및 추론 강도',
+] as const
+
+const cliRoots = integrationEnabled ? parseCliRoots(process.env.DSH_CLI_ROOTS ?? '') : []
+const integrationDescribe = integrationEnabled ? describe : describe.skip
+
+/** One official DSH root with the capability profile its version maps to. */
+type OfficialRoot = {
+  readonly cliRoot: string
+  readonly version: string
+  readonly settingsModel: SettingsModel
+}
+
+function officialRootsOf(roots: readonly string[]): OfficialRoot[] {
+  return roots.map((cliRoot) => {
+    const version = readOfficialDshVersion(cliRoot)
+    const settingsModel = capabilitiesForVersion(version)?.settingsModel
+    if (settingsModel === undefined) {
+      throw new Error(`official DSH root version is not mapped to a settings model: ${cliRoot} (${version})`)
+    }
+    return { cliRoot, version, settingsModel }
+  })
+}
+
+/**
+ * The five roots split by settings model. `namespaceRoots` carry the deep
+ * per-root body (registration, the `dsh-thinking-effort` namespace, legacy
+ * `settings.mutate` argument shapes); `entryConfigRoots` carry the case written
+ * for the rewritten model, where a section is addressed by its Loader entry id
+ * and its form is derived from the entry's own `Config`. Both counts are
+ * asserted in the cases below, so an added root cannot silently join neither.
+ */
+const officialRoots = integrationEnabled ? officialRootsOf(cliRoots) : []
+const namespaceRoots = officialRoots.filter(({ settingsModel }) => settingsModel === 'namespace')
+const entryConfigRoots = officialRoots.filter(({ settingsModel }) => settingsModel === 'entry-config')
+
+function readPackage(): PackageManifest {
+  return JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as PackageManifest
+}
+
+function runOfficialDsh(cliRoot: string, home: string, args: readonly string[]): string {
+  const result = spawnSync('pnpm', ['dsh', ...args], {
+    cwd: cliRoot,
+    env: { ...process.env, DSH_HOME: home },
+    encoding: 'utf8',
+  })
+  const output = `${result.stdout ?? ''}${result.stderr ?? ''}`
+  if (result.error !== undefined || result.status !== 0) {
+    throw new Error(`official dsh command failed (${result.status ?? 'no status'}): pnpm dsh ${args.join(' ')}\n${output}`)
+  }
+  return output
+}
+
+function packLocalPackage(destination: string): string {
+  const packed = JSON.parse(execFileSync('npm', [
+    'pack', '--json', '--pack-destination', destination,
+  ], {
+    cwd: root,
+    env: { ...process.env, npm_config_cache: '/tmp/dsh-pi-effort-npm-cache' },
+    encoding: 'utf8',
+  })) as Array<{ filename: string }>
+  const tarball = packed[0]?.filename
+  if (tarball === undefined) throw new Error('npm pack did not report a tarball filename')
+  return join(destination, basename(tarball))
+}
+
+type RunningWeb = {
+  readonly url: string
+  readonly cookie: string
+  readonly stop: () => Promise<void>
+}
+
+type WebStartOptions = {
+  readonly command?: string
+  readonly args?: readonly string[]
+  readonly stopTimeoutMs?: number
+}
+
+type OfficialRpcResponse = {
+  readonly status: number
+  readonly body: {
+    readonly type?: string
+    readonly rpcId?: string
+    readonly result?: unknown
+  }
+}
+
+async function callOfficialRpc(
+  baseUrl: string,
+  headers: Record<string, string>,
+  endpoint: string,
+  args: Record<string, unknown>,
+  wrapArgs = true,
+): Promise<OfficialRpcResponse> {
+  const response = await fetch(new URL(`/api/${endpoint}`, baseUrl), {
+    method: 'POST',
+    headers: { ...headers, 'content-type': 'application/json' },
+    body: JSON.stringify({
+      type: 'client-request',
+      rpcId: `loader-${endpoint.replaceAll('/', '-')}`,
+      method: endpoint,
+      payload: wrapArgs ? { args } : args,
+    }),
+    signal: AbortSignal.timeout(10000),
+  })
+  return {
+    status: response.status,
+    body: await response.json() as OfficialRpcResponse['body'],
+  }
+}
+
+function loadBrowserBundle(bundlePath: string, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  let factory: ((require: (specifier: string) => unknown) => Record<string, unknown>) | undefined
+  runInNewContext(readFileSync(bundlePath, 'utf8'), {
+    window: { __ModuleLoader__: { load: (entry: { factory?: typeof factory }) => { factory = entry.factory } } },
+    navigator: { languages: ['en'], language: 'en' },
+  })
+  if (factory === undefined) throw new Error(`bundle did not register a factory: ${bundlePath}`)
+  const localRequire = createRequire(bundlePath)
+  return factory((specifier) => overrides[specifier] ?? localRequire(specifier))
+}
+
+async function probeOfficialClientRuntime(
+  cliRoot: string,
+  packagedClient: Record<string, unknown>,
+): Promise<{
+  modern: { languages: string[]; sectionIds: string[]; supportsExternalLanguages: boolean }
+  legacy: { languages: string[]; sectionIds: string[]; supportsExternalLanguages: boolean }
+}> {
+  const importOfficial = (relativePath: string): Promise<Record<string, unknown>> => import(
+    pathToFileURL(join(cliRoot, relativePath)).href,
+  ) as Promise<Record<string, unknown>>
+  const cordis = await importOfficial('vendor/cordis/lib/index.js')
+  const slotsModule = await importOfficial('packages/client/ui-slots/lib/index.js')
+  const runtimePath = join(cliRoot, 'packages/client/runtime/lib/client.js')
+  const renderer = existsSync(runtimePath)
+    ? loadBrowserBundle(runtimePath, { '@deepseek-ai/dsh-client-ui-slots': slotsModule })
+    : loadBrowserBundle(join(cliRoot, 'packages/client/ui-renderer/lib/client.js'), {
+      '@deepseek-ai/dsh-client-ui-slots': slotsModule,
+    })
+  const locale = loadBrowserBundle(join(cliRoot, 'packages/client/locale/lib/client.js'), {
+    '@deepseek-ai/dsh-client-ui-primitives': {},
+    '@deepseek-ai/dsh-client-store': { defineStore: () => ({}) },
+    '@deepseek-ai/dsh-client-runtime/client': renderer,
+  })
+  const Context = cordis.Context as new () => {
+    plugin: (plugin: unknown, config?: unknown) => { await: () => Promise<unknown> }
+    provide: (name: string, value: unknown) => void
+    get: (name: string) => unknown
+  }
+  const SlotRegistry = renderer.SlotRegistry as new (ctx: unknown) => unknown
+  const LocaleRuntime = locale.LocaleRuntime as new (ctx: unknown) => {
+    getSnapshot: () => { locales: readonly { id: string }[] }
+  }
+  const apply = packagedClient.apply as (ctx: unknown) => void
+  const results = {} as {
+    modern: { languages: string[]; sectionIds: string[]; supportsExternalLanguages: boolean }
+    legacy: { languages: string[]; sectionIds: string[]; supportsExternalLanguages: boolean }
+  }
+
+  for (const mode of ['modern', 'legacy'] as const) {
+    const ctx = new Context()
+    await ctx.plugin(SlotRegistry).await()
+    const slots = ctx.get('slots') as {
+      register: (options: unknown, component: unknown) => () => void
+      entries: (name: string) => readonly { options?: { id?: string } }[]
+    }
+    slots.register({
+      name: 'root',
+      children: { 'settings.section': { kind: 'list', scope: 'root' } },
+    }, () => null)
+    const runtimeLocale = new LocaleRuntime(ctx)
+    ctx.provide('locale', runtimeLocale)
+    if (mode === 'modern') {
+      ctx.provide('connection', { isLoopback: true })
+      ctx.provide('remote.settings', {
+        describe: () => Promise.resolve({ ok: true, value: { namespaces: [] } }),
+        mutate: () => Promise.resolve({ ok: true, value: {} }),
+      })
+    } else {
+      ctx.provide('remote.settings', {})
+      ctx.provide('connection', {
+        isLoopback: true,
+        api: {
+          settings: {
+            describe: () => Promise.resolve({ result: { ok: true, value: { namespaces: [] } } }),
+            mutate: () => Promise.resolve({ result: { ok: true, value: {} } }),
+          },
+        },
+      })
+    }
+    apply(ctx)
+    await new Promise<void>((resolveWait) => setImmediate(resolveWait))
+    results[mode] = {
+      languages: runtimeLocale.getSnapshot().locales.map(({ id }) => id),
+      sectionIds: slots.entries('settings.section').flatMap(({ options }) => options?.id === undefined ? [] : [options.id]),
+      supportsExternalLanguages: typeof (runtimeLocale as { addLanguage?: unknown }).addLanguage === 'function',
+    }
+  }
+  return results
+}
+
+type ProbeWireRequest = {
+  readonly url: string
+  readonly headers: Record<string, string>
+  readonly body: string
+}
+
+type ProbeRequestFacts = {
+  readonly provider: unknown
+  readonly model: unknown
+  readonly sessionId: unknown
+  readonly reasoningEffort: unknown
+  readonly messages: unknown
+  readonly system: unknown
+  readonly tools: unknown
+  readonly temperature: unknown
+  readonly maxTokens: unknown
+  readonly stop: unknown
+  readonly purpose: unknown
+  readonly hasSignal: boolean
+  readonly body: string
+}
+
+type ProbeRequestRecord = {
+  readonly key: string
+  readonly options: ProbeRequestFacts
+  readonly wire: ProbeWireRequest
+}
+
+type ProbeAgentRun = {
+  readonly requestKey: string
+  readonly requestCount: number
+  readonly reasoningEffort: unknown
+  readonly origin: unknown
+  readonly turnEnd: string | undefined
+  readonly requests: readonly ProbeRequestRecord[]
+}
+
+async function probePackagedArtifactHandMountedRuntime(
+  cliRoot: string,
+  hostEntry: string,
+): Promise<{
+  settingsHome: string
+  settingsPath: string
+  handMountedMarkerPath: string
+  handMountedMarker: { event?: string; name?: string; at?: string; pid?: number }
+  withoutProduct: ProbeAgentRun
+  withProduct: ProbeAgentRun
+  outbound: {
+    readonly baseline: readonly ProbeRequestRecord[]
+    readonly product: readonly ProbeRequestRecord[]
+  }
+}> {
+  const importOfficial = (relativePath: string): Promise<Record<string, unknown>> => import(
+    pathToFileURL(join(cliRoot, relativePath)).href,
+  ) as Promise<Record<string, unknown>>
+  const cordis = await importOfficial('vendor/cordis/lib/index.js')
+  const schemasteryRequire = createRequire(join(cliRoot, 'vendor/schemastery/package.json'))
+  const settingsFileRequire = createRequire(join(cliRoot, 'packages/settings/settings-file/package.json'))
+  const schemastery = await import(pathToFileURL(schemasteryRequire.resolve('@deepseek-ai/schemastery')).href) as unknown as Record<string, unknown>
+  const settingsFile = await import(pathToFileURL(settingsFileRequire.resolve('@deepseek-ai/dsh-settings-file')).href) as unknown as Record<string, unknown>
+  const llm = await importOfficial('packages/llm/llm/lib/index.js')
+  const session = await importOfficial('packages/core/session/lib/index.js')
+  const systemPrompt = await importOfficial('packages/core/system-prompt/lib/index.js')
+  const tools = await importOfficial('packages/core/tools/lib/index.js')
+  const agents = await importOfficial('packages/core/agent/lib/index.js')
+  const agentLoop = await importOfficial('packages/core/agent-loop/lib/index.js')
+  const sessionProjection = existsSync(join(cliRoot, 'packages/session/session-projection/lib/index.js'))
+    ? await importOfficial('packages/session/session-projection/lib/index.js')
+    : undefined
+  const timer = await importOfficial('vendor/timer/lib/index.js')
+  const Context = cordis.Context as new () => {
+    plugin: (plugin: unknown, config?: unknown) => { await: () => Promise<unknown> }
+    get: (name: string) => unknown
+    fiber: { dispose: () => Promise<void> }
+    agents: {
+      create: (options: Record<string, unknown>) => Promise<{ agent: {
+        session: { header: Record<string, unknown>; events: readonly { type: string }[] }
+        followup: (message: unknown) => void
+        whenIdle: () => Promise<void>
+      }; dispose: () => Promise<void> }>
+    }
+    llm: { registerAdapter: (providers: string[], adapter: unknown) => unknown }
+  }
+  const agentHome = mkdtempSync(join(tmpdir(), 'dsh-thinking-effort-agent-'))
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = agentHome
+  const markerPath = join(agentHome, 'thinking-effort-loaded.json')
+  const originalFetch = globalThis.fetch
+  let hostFiber: { dispose: () => Promise<void> } | undefined
+  const wireRequestsByKey = new Map<string, ProbeWireRequest[]>()
+  const requestRecordsByKey = new Map<string, ProbeRequestRecord[]>()
+  const probeFetch = (async (input, init) => {
+    const headers = new Headers(init?.headers)
+    const key = headers.get('x-probe-request-key')
+    if (key === null) throw new Error('probe request did not carry its request key')
+    const wire: ProbeWireRequest = {
+      url: String(input),
+      headers: Object.fromEntries(headers.entries()),
+      body: typeof init?.body === 'string' ? init.body : '',
+    }
+    const queued = wireRequestsByKey.get(key) ?? []
+    queued.push(wire)
+    wireRequestsByKey.set(key, queued)
+    return new Response('ok')
+  }) as typeof fetch
+  globalThis.fetch = probeFetch
+  try {
+    const ctx = new Context()
+    try {
+      await ctx.plugin(timer.default).await()
+      await ctx.plugin(settingsFile.default ?? settingsFile.FileSettingsProvider, { dshHome: agentHome, watch: false }).await()
+      const z = schemastery.default as {
+        object: (shape: Record<string, unknown>) => unknown
+        dict: (value: unknown) => unknown
+        any: () => unknown
+        string: () => unknown
+      }
+      const settings = ctx.get('settings') as {
+        register: (namespace: string, schema: unknown) => { update: (value: Record<string, unknown>) => Promise<void> }
+        describe: () => Array<Record<string, unknown>>
+        mutate: (namespace: string, ops: readonly { op: 'set' | 'unset'; path: readonly string[]; value?: unknown }[], expectedRevision: number) => Promise<unknown>
+        get: (namespace: string) => unknown
+      }
+    const settingsScope = settings.register('llm-pi-ai', z.object({
+      providers: z.dict(z.any()),
+      subagentEffort: z.string(),
+    }))
+    await settingsScope.update({ subagentEffort: 'low', providers: { probe: { models: [{ id: 'probe-model' }] } } })
+    const settingsDescriptor = settings.describe().find(entry => entry.ns === 'llm-pi-ai')
+    expect(settingsDescriptor?.user).toMatchObject({ subagentEffort: 'low' })
+    const settingsPath = join(agentHome, 'settings.yaml')
+    expect(existsSync(settingsPath)).toBe(true)
+
+    const LlmAdapter = llm.LlmAdapter as new () => {
+      resolveModel(provider: string, model: string): Promise<Record<string, unknown>>
+      stream(options: Record<string, unknown>): AsyncIterable<Record<string, unknown>>
+    }
+    const ReasoningEffortId = llm.ReasoningEffortId as (value: string) => unknown
+    const requestKeyOf = (sessionId: string, provider: string, model: string): string => (
+      JSON.stringify([sessionId, provider, model])
+    )
+    const requestKeyFromOptions = (options: Record<string, unknown>): string => {
+      if (typeof options.sessionId !== 'string' || typeof options.provider !== 'string' || typeof options.model !== 'string') {
+        throw new Error('probe GenerateOptions lacks sessionId/provider/model')
+      }
+      return requestKeyOf(options.sessionId, options.provider, options.model)
+    }
+    class ProbeAdapter extends LlmAdapter {
+      override resolveModel(provider: string, model: string): Promise<Record<string, unknown>> {
+        const lowEffort = ReasoningEffortId('low')
+        const highEffort = ReasoningEffortId('high')
+        return Promise.resolve({
+          provider,
+          id: model,
+          name: model,
+          reasoning: { efforts: [{ id: lowEffort, name: 'Low' }, { id: highEffort, name: 'High' }], defaultEffort: lowEffort },
+        })
+      }
+
+      override async * stream(options: Record<string, unknown>): AsyncIterable<Record<string, unknown>> {
+        const requestKey = requestKeyFromOptions(options)
+        const body = JSON.stringify({
+           api: 'openai-completions',
+           provider: options.provider,
+           model: options.model,
+           messages: options.messages,
+         })
+         await fetch('http://gateway.test/v1/chat/completions', {
+           method: 'POST',
+           headers: { 'content-type': 'application/json', 'x-probe-request-key': requestKey },
+           body,
+         })
+         const wire = wireRequestsByKey.get(requestKey)?.shift()
+          if (wire === undefined) throw new Error(`missing wire record for ${requestKey}`)
+          const record: ProbeRequestRecord = {
+            key: requestKey,
+            wire,
+            options: {
+
+           provider: options.provider,
+           model: options.model,
+           sessionId: options.sessionId,
+           reasoningEffort: options.reasoningEffort,
+           messages: options.messages,
+           system: options.system,
+           tools: options.tools,
+           temperature: options.temperature,
+           maxTokens: options.maxTokens,
+           stop: options.stop,
+           purpose: options.purpose,
+           hasSignal: options.signal instanceof AbortSignal,
+           body,
+         },
+         }
+         const records = requestRecordsByKey.get(requestKey) ?? []
+         records.push(record)
+         requestRecordsByKey.set(requestKey, records)
+        const text = 'real agent runtime probe'
+        yield { type: 'block-start', index: 0, blockType: 'text' }
+        yield { type: 'text-delta', index: 0, text }
+        yield { type: 'block-end', index: 0, block: { type: 'text', text } }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      }
+    }
+    await ctx.plugin(llm.default).await()
+    await ctx.plugin(session.default).await()
+    if (sessionProjection !== undefined) await ctx.plugin(sessionProjection.default).await()
+    await ctx.plugin(systemPrompt.default, {}).await()
+    await ctx.plugin(tools.default, {}).await()
+    await ctx.plugin(agents.default).await()
+    await ctx.plugin(agentLoop.default, { agents: [] }).await()
+    ctx.llm.registerAdapter(['probe', 'other'], new ProbeAdapter())
+
+    const runAgent = async (sessionId: string, provider = 'probe', model = 'probe-model'): Promise<ProbeAgentRun> => {
+       const requestKey = requestKeyOf(sessionId, provider, model)
+      const handle = await ctx.agents.create({
+        sessionId,
+        meta: { origin: 'subagent' },
+        agentOptions: { provider, model },
+      })
+      try {
+        const message = (llm.createUserMessage as (input: Record<string, unknown>) => unknown)({
+          content: [{ type: 'text', text: 'run the real agent request probe' }],
+          source: { kind: 'user' },
+        })
+        handle.agent.followup(message)
+        await handle.agent.whenIdle()
+        const session = handle.agent.session as {
+          snapshotEvents?: () => readonly { type: string }[]
+          events?: Iterable<{ type: string }>
+          header: { origin?: unknown }
+        }
+        const events = typeof session.snapshotEvents === 'function'
+          ? session.snapshotEvents()
+          : session.events ?? []
+        const turnEnd = [...events].reverse().find((event) => event.type === 'turn/end')
+        const requests = [...(requestRecordsByKey.get(requestKey) ?? [])]
+        return {
+          requestKey,
+          requestCount: requests.length,
+          reasoningEffort: requests.at(-1)?.options.reasoningEffort,
+          origin: session.header.origin,
+          turnEnd: turnEnd?.type,
+          requests,
+        }
+      } finally {
+        await handle.dispose()
+      }
+    }
+
+    const withoutProduct = await runAgent(`agent-probe-baseline-${Date.now()}`, 'probe', 'model-a')
+
+    const host = await import(pathToFileURL(hostEntry).href) as { name: string; inject?: readonly string[]; apply: (context: unknown) => void }
+    hostFiber = await ctx.plugin(host).await() as { dispose: () => Promise<void> }
+    const productionFetch = globalThis.fetch
+    expect(productionFetch).not.toBe(originalFetch)
+
+
+    const sessionNamespace = settings.describe().find(entry => entry.ns === 'dsh-thinking-effort')
+    expect(sessionNamespace).toBeDefined()
+    if (sessionNamespace === undefined) throw new Error('missing dsh-thinking-effort namespace in agent probe')
+    const sessionPath = ['opencodeSession', 'providers', 'probe', 'models', 'model-a']
+    await settings.mutate('dsh-thinking-effort', [{ op: 'set', path: sessionPath, value: true }], Number(sessionNamespace.revision))
+    await new Promise<void>((resolveWait) => setImmediate(resolveWait))
+    const productRuns = await Promise.all([
+       runAgent(`agent-probe-product-enabled-${Date.now()}`, 'probe', 'model-a'),
+       runAgent(`agent-probe-product-sibling-${Date.now()}`, 'probe', 'model-b'),
+       runAgent(`agent-probe-product-provider-${Date.now()}`, 'other', 'model-a'),
+     ])
+    const withProduct = productRuns[0]!
+
+
+    const marker = JSON.parse(readFileSync(markerPath, 'utf8')) as {
+      event?: string
+      name?: string
+      at?: string
+      pid?: number
+    }
+    expect(marker).toMatchObject({ event: 'apply', name: '@hytime/dsh-thinking-effort' })
+    expect(marker.at).toEqual(expect.any(String))
+    expect(marker.pid).toEqual(expect.any(Number))
+    return {
+       settingsHome: agentHome,
+       settingsPath,
+       handMountedMarkerPath: markerPath,
+       handMountedMarker: marker,
+       withoutProduct,
+       withProduct,
+       outbound: {
+         baseline: withoutProduct.requests,
+         product: productRuns.flatMap((run) => run.requests),
+       },
+     }
+    } finally {
+      await hostFiber?.dispose()
+      await ctx.fiber.dispose()
+      try {
+        expect(globalThis.fetch).toBe(probeFetch)
+      } finally {
+        globalThis.fetch = originalFetch
+      }
+    }
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    rmSync(agentHome, { recursive: true, force: true })
+  }
+}
+
+type BrowserLocator = {
+  click: (options?: { readonly timeout?: number }) => Promise<void>
+  count: () => Promise<number>
+  waitFor: (options?: Record<string, unknown>) => Promise<void>
+  getByRole: (role: string, options: { name: string | RegExp }) => BrowserLocator
+}
+
+type BrowserPage = {
+  goto: (url: string, options?: Record<string, unknown>) => Promise<unknown>
+  locator: (selector: string) => {
+    allTextContents: () => Promise<string[]>
+    innerText: () => Promise<string>
+  }
+  getByRole: (role: string, options: { name: string | RegExp }) => BrowserLocator
+  waitForTimeout: (timeout: number) => Promise<void>
+  on: (event: string, listener: (value: unknown) => void) => BrowserPage
+}
+
+type BrowserContext = {
+  addCookies: (cookies: readonly Record<string, string>[]) => Promise<void>
+  newPage: () => Promise<BrowserPage>
+}
+
+type Playwright = {
+  chromium: { launch: (options: Record<string, unknown>) => Promise<{ newContext: () => Promise<BrowserContext>; close: () => Promise<void> }> }
+}
+
+function discoverBrowserExecutable(): string | undefined {
+  const configured = process.env.CHROME_PATH
+  if (configured !== undefined && configured !== '') {
+    if (!existsSync(configured)) throw new Error(`BLOCKED: CHROME_PATH does not exist: ${configured}`)
+    return configured
+  }
+  for (const command of ['google-chrome', 'chromium', 'chromium-browser', 'chrome']) {
+    const result = spawnSync('which', [command], { encoding: 'utf8' })
+    if (result.status === 0) {
+      const executable = result.stdout.trim()
+      if (executable !== '' && existsSync(executable)) return executable
+    }
+  }
+  const appSearch = spawnSync('mdfind', ["kMDItemCFBundleIdentifier == 'com.google.Chrome'"], { encoding: 'utf8' })
+  if (appSearch.status === 0) {
+    for (const app of appSearch.stdout.split('\n').map(value => value.trim()).filter(Boolean)) {
+      const executable = join(app, 'Contents', 'MacOS', 'Google Chrome')
+      if (existsSync(executable)) return executable
+    }
+  }
+  const managedPath = process.env.PLAYWRIGHT_BROWSERS_PATH
+  if (managedPath !== undefined && managedPath !== '' && managedPath !== '0' && !existsSync(managedPath)) {
+    throw new Error(`BLOCKED: PLAYWRIGHT_BROWSERS_PATH does not exist: ${managedPath}`)
+  }
+  return undefined
+}
+async function probeOfficialSettingsDom(cliRoot: string, web: RunningWeb): Promise<{
+  bodyText: string
+  buttons: string[]
+  settingsText: string
+  thinkingEffortVisible: boolean
+  errors: string[]
+  blocked?: string
+}> {
+  let playwright: Playwright
+  let executablePath: string | undefined
+  try {
+    const playwrightPath = createRequire(join(cliRoot, 'apps/web/package.json')).resolve('playwright')
+    playwright = await import(pathToFileURL(playwrightPath).href) as unknown as Playwright
+    executablePath = discoverBrowserExecutable()
+  } catch (error) {
+    return { bodyText: '', buttons: [], settingsText: '', thinkingEffortVisible: false, errors: [], blocked: String(error) }
+  }
+  let browser: Awaited<ReturnType<Playwright['chromium']['launch']>>
+  try {
+    browser = await playwright.chromium.launch({
+      headless: true,
+      ...(executablePath === undefined ? {} : { executablePath }),
+    })
+  } catch (error) {
+    return { bodyText: '', buttons: [], settingsText: '', thinkingEffortVisible: false, errors: [], blocked: `BLOCKED: browser launch failed: ${String(error)}` }
+  }
+  try {
+    const context = await browser.newContext()
+    if (web.cookie !== '') {
+      const separator = web.cookie.indexOf('=')
+      await context.addCookies([{
+        name: web.cookie.slice(0, separator),
+        value: web.cookie.slice(separator + 1),
+        domain: '127.0.0.1',
+        path: '/',
+      }])
+    }
+    const page = await context.newPage()
+    const errors: string[] = []
+    page.on('pageerror', value => { errors.push(String(value)) })
+    await page.goto(web.url, { waitUntil: 'domcontentloaded', timeout: 20000 })
+    const bodyText = await page.locator('body').innerText()
+    const buttons = await page.locator('button').allTextContents()
+    await page.getByRole('button', { name: localizedNavigationLabels.continue }).click()
+    await page.waitForTimeout(500)
+    const configureLater = page.getByRole('button', { name: localizedNavigationLabels.configureLater })
+    if ((await configureLater.count().catch(() => 0)) > 0) {
+      await configureLater.click()
+      await page.waitForTimeout(500)
+    }
+    const chooseWorkspace = page.getByRole('button', { name: localizedNavigationLabels.chooseWorkspace })
+    if ((await chooseWorkspace.count().catch(() => 0)) > 0) {
+      await chooseWorkspace.click()
+      const workspaceDialog = page.getByRole('dialog', { name: /^(选择工作区目录|Select Workspace Directory)$/ })
+      // Newer hosts complete workspace selection without this in-app dialog, so
+      // treat it as an optional step and dismiss it only when it appears.
+      const dialogAppeared = await workspaceDialog.waitFor({ state: 'visible', timeout: 10000 })
+        .then(() => true)
+        .catch(() => false)
+      if (dialogAppeared) {
+        await workspaceDialog.getByRole('button', { name: /^(取消|Cancel)$/ }).click()
+        await workspaceDialog.waitFor({ state: 'hidden', timeout: 10000 })
+      }
+    }
+    await page.getByRole('button', { name: localizedNavigationLabels.settings }).click()
+    await page.waitForTimeout(500)
+    /**
+     * The namespace model nests plugin sections under a "Plugins" group, so the
+     * group has to be expanded before the section appears. The entry-config
+     * model lists every section in its own nav, and the regex then matches the
+     * background toolbar's Plugins button instead — which the settings modal
+     * leaves behind an inert mask, so its click can never land.
+     *
+     * Only that case is tolerated, and it is recognised by the section already
+     * being on screen. Any other failure — a host whose nav the click cannot
+     * reach within the bounded wait — is rethrown, so the probe cannot degrade
+     * into "the group did not open, so I looked at the wrong page".
+     */
+    const pluginsGroup = page.getByRole('button', { name: localizedNavigationLabels.plugins })
+    try {
+      await pluginsGroup.click({ timeout: 10000 })
+    } catch (error) {
+      const currentText = await page.locator('body').innerText()
+      const reachedWithoutGroup = thinkingEffortSectionTitles.some((title) => currentText.includes(title))
+      if (!reachedWithoutGroup) throw error
+      console.log('[probe] settings nav lists the section directly; no Plugins group to expand')
+    }
+    await page.waitForTimeout(3000)
+    const settingsText = await page.locator('body').innerText()
+    return {
+      bodyText,
+      buttons,
+      settingsText,
+      thinkingEffortVisible: thinkingEffortSectionTitles.some((title) => settingsText.includes(title)),
+      errors,
+    }
+  } finally {
+    await browser.close()
+  }
+}
+
+/**
+ * Run the real-browser settings probe against a served Web host and turn its
+ * outcome into assertions.
+ *
+ * `DSH_REQUIRE_THINKING_EFFORT_DOM=1` (the publish workflow) makes both a probe
+ * blocked by the environment and a page that does not render the section hard
+ * failures. Without it a blocked probe or a missing section is logged with the
+ * caller's context instead of skipped silently.
+ */
+async function assertSettingsDomProbe(
+  cliRoot: string,
+  web: RunningWeb,
+  logContext: string,
+): Promise<void> {
+  const domProbe = await probeOfficialSettingsDom(cliRoot, web)
+  if (domProbe.blocked !== undefined) {
+    if (process.env.DSH_REQUIRE_THINKING_EFFORT_DOM === '1') {
+      throw new Error(`required DSH Web DOM probe was blocked: ${domProbe.blocked}`)
+    }
+    console.log(`[BLOCKED] browser probe: ${domProbe.blocked}`)
+    return
+  }
+  expect(domProbe.settingsText).toMatch(/插件|Plugins/)
+  expect(domProbe.errors).toEqual([])
+  if (!domProbe.thinkingEffortVisible) {
+    if (process.env.DSH_REQUIRE_THINKING_EFFORT_DOM === '1') {
+      throw new Error('thinking-effort settings section is absent from the real DSH Web DOM')
+    }
+    console.log(`[BLOCKED] thinking-effort section missing; DOM=${JSON.stringify(domProbe.settingsText)}; ${logContext}`)
+  }
+}
+
+function extractBootRows(html: string): string[] {
+  const prefixes = [
+    '<script>globalThis["__DSH_BOOT__"] = ',
+    '<script>window.__DSH_BOOT__ = ',
+  ]
+  const matchedPrefix = prefixes.find((candidate) => html.includes(candidate))
+  if (matchedPrefix === undefined) throw new Error('DSH Web page did not inject __DSH_BOOT__')
+  const valueStart = html.indexOf(matchedPrefix) + matchedPrefix.length
+  const end = html.indexOf('</script>', valueStart)
+  if (end === -1) throw new Error('DSH Web page has an unterminated __DSH_BOOT__ injection')
+  const graph = JSON.parse(html.slice(valueStart, end)) as {
+    entries?: Array<{ id?: string; url?: string }>
+  }
+  return graph.entries?.map(({ id, url }) => `${id ?? '<missing-id>'} ${url ?? '<missing-url>'}`) ?? []
+}
+
+function extractBundleUrl(html: string, packageName: string): string {
+  const prefixes = [
+    '<script>globalThis["__DSH_BOOT__"] = ',
+    '<script>window.__DSH_BOOT__ = ',
+  ]
+  const matchedPrefix = prefixes.find((candidate) => html.includes(candidate))
+  if (matchedPrefix === undefined) throw new Error('DSH Web page did not inject __DSH_BOOT__')
+  const start = html.indexOf(matchedPrefix)
+  const valueStart = start + matchedPrefix.length
+  const end = html.indexOf('</script>', valueStart)
+  if (end === -1) throw new Error('DSH Web page has an unterminated __DSH_BOOT__ injection')
+  const graph = JSON.parse(html.slice(valueStart, end)) as {
+    entries?: Array<{ id?: string; url?: string }>
+  }
+  const entry = graph.entries?.find((candidate) => candidate.id === packageName)
+  if (entry?.url === undefined) throw new Error(`DSH Web graph did not advertise ${packageName}`)
+  return entry.url
+}
+
+async function startOfficialWeb(cliRoot: string, home: string, options: WebStartOptions = {}): Promise<RunningWeb> {
+  const child = spawn(options.command ?? 'pnpm', options.args ?? ['dsh', '--profile', 'web', '--no-open', '--port', '0'], {
+    cwd: cliRoot,
+    env: { ...process.env, DSH_HOME: home, DSH_TELEMETRY_DISABLED: '1' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  const stopTimeoutMs = options.stopTimeoutMs ?? 5000
+  let output = ''
+  let timer: NodeJS.Timeout | undefined
+  let resolveUrl: ((url: string) => void) | undefined
+  let rejectUrl: ((error: Error) => void) | undefined
+  let childErrored = false
+  let childClosed = false
+  let stopPromise: Promise<void> | undefined
+  let resolveChildSettled: (() => void) | undefined
+  const childSettled = new Promise<void>((resolve) => {
+    resolveChildSettled = resolve
+  })
+  const settleChild = (): void => {
+    resolveChildSettled?.()
+    resolveChildSettled = undefined
+  }
+  child.once('error', (error) => {
+    childErrored = true
+    settleChild()
+    rejectUrl?.(error)
+  })
+  child.once('exit', (code, signal) => {
+    if (resolveUrl === undefined) return
+    rejectUrl?.(new Error(`DSH web exited before announcing a URL (code=${code}, signal=${signal})\n${output}`))
+  })
+  child.once('close', () => {
+    childClosed = true
+    settleChild()
+  })
+  const waitForChild = async (): Promise<boolean> => {
+    if (childErrored || childClosed) return true
+    let waitTimer: NodeJS.Timeout | undefined
+    try {
+      return await Promise.race([
+        childSettled.then(() => true),
+        new Promise<boolean>((resolveWait) => {
+          waitTimer = setTimeout(() => resolveWait(false), stopTimeoutMs)
+        }),
+      ])
+    } finally {
+      if (waitTimer !== undefined) clearTimeout(waitTimer)
+    }
+  }
+  const stop = (): Promise<void> => {
+    if (stopPromise !== undefined) return stopPromise
+    stopPromise = (async () => {
+      if (!childErrored && !childClosed && child.exitCode === null && child.signalCode === null) {
+        try {
+          child.kill('SIGTERM')
+        } catch {
+          // The error/close event or the bounded fallback handles a raced exit.
+        }
+      }
+      if (await waitForChild()) return
+      if (!childErrored && !childClosed && child.exitCode === null && child.signalCode === null) {
+        try {
+          child.kill('SIGKILL')
+        } catch {
+          // A concurrent exit is already being observed through close/error.
+        }
+      }
+      await waitForChild()
+    })()
+    return stopPromise
+  }
+  const url = new Promise<string>((resolveUrlPromise, rejectUrlPromise) => {
+    resolveUrl = resolveUrlPromise
+    rejectUrl = rejectUrlPromise
+  })
+  const consume = (chunk: Buffer): void => {
+    output += chunk.toString()
+    const match = output.match(/https?:\/\/127\.0\.0\.1:\d+(?:\/\?token=[^\s]+)?/)
+    if (match !== null) {
+      if (timer !== undefined) clearTimeout(timer)
+      resolveUrl?.(match[0])
+    }
+  }
+  child.stdout?.on('data', consume)
+  child.stderr?.on('data', consume)
+  timer = setTimeout(() => rejectUrl?.(new Error(`timed out waiting for DSH web URL\n${output}`)), 30000)
+
+  try {
+    const launchUrl = await url
+    const baseUrl = new URL(launchUrl)
+    let cookie = ''
+    if (baseUrl.searchParams.has('token')) {
+      const launchResponse = await fetch(launchUrl, {
+        redirect: 'manual',
+        signal: AbortSignal.timeout(10000),
+      })
+      if (launchResponse.status !== 303) {
+        throw new Error(`DSH Web token exchange failed with HTTP ${String(launchResponse.status)}`)
+      }
+      const setCookie = launchResponse.headers.get('set-cookie')
+      if (setCookie === null) throw new Error('DSH Web token exchange did not set a session cookie')
+      cookie = setCookie.split(';', 1)[0]!
+      baseUrl.search = ''
+    }
+
+    console.log(`[DSH loader integration] ${cliRoot} ${baseUrl.href}`)
+
+    return {
+      url: baseUrl.href,
+      cookie,
+      stop,
+    }
+  } catch (error) {
+    if (timer !== undefined) clearTimeout(timer)
+    await stop()
+    throw error
+  }
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`test timeout after ${timeoutMs}ms`)), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
+/**
+ * Windows does not deliver POSIX signals: `child.kill('SIGTERM')` terminates the
+ * process outright, so a child's own `SIGTERM` handler never runs and a marker it
+ * writes there can never appear. The cleanup guarantee still holds on that
+ * platform — `stop()` must leave no surviving child — so the case below asserts
+ * the observable form each platform can actually produce rather than skipping
+ * the check: a recorded `stopped` state on POSIX, an absent process id on
+ * Windows. The one property Windows genuinely cannot express is stdio-based
+ * `close` waiting, which needs the descendant's inherited handles; that case is
+ * skipped there.
+ */
+const posixSignals = process.platform !== 'win32'
+
+describe('official DSH web startup cleanup', () => {
+  it('stops and waits for the child when token exchange fails', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dsh-thinking-effort-cleanup-'))
+    const markerPath = join(directory, 'child-state')
+    const script = [
+      "import { writeFileSync } from 'node:fs'",
+      `const marker = ${JSON.stringify(markerPath)}`,
+      "writeFileSync(marker, JSON.stringify({ state: 'started', pid: process.pid }))",
+      "process.on('SIGTERM', () => { writeFileSync(marker, JSON.stringify({ state: 'stopped', pid: process.pid })); process.exit(0) })",
+      "process.stdout.write('http://127.0.0.1:1/?token=broken\\n')",
+      'setInterval(() => {}, 1000)',
+    ].join(';')
+    let childPid: number | undefined
+
+    try {
+      await expect(startOfficialWeb('/tmp', directory, {
+        command: process.execPath,
+        args: ['--input-type=module', '-e', script],
+      })).rejects.toThrow()
+      const recorded = JSON.parse(readFileSync(markerPath, 'utf8')) as { state?: string; pid?: number }
+      childPid = recorded.pid
+      expect(recorded.pid).toEqual(expect.any(Number))
+      if (posixSignals) {
+        expect(recorded.state).toBe('stopped')
+      } else {
+        expect(recorded.state).toBe('started')
+        expect(() => process.kill(childPid!, 0)).toThrow()
+      }
+    } finally {
+      if (childPid !== undefined) {
+        try {
+          process.kill(childPid, 'SIGKILL')
+        } catch {
+          // The assertion above normally proves the child already exited.
+        }
+      }
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  it.skipIf(!posixSignals)('waits for close after exit when a descendant keeps stdio open', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dsh-thinking-effort-close-'))
+    const donePath = join(directory, 'grandchild-done')
+    const markerPath = join(directory, 'grandchild-pid')
+    const grandchildScript = `import { writeFileSync } from 'node:fs'; setTimeout(() => writeFileSync(${JSON.stringify(donePath)}, 'done'), 150)`
+    const script = [
+      "import { spawn } from 'node:child_process'",
+      "import { writeFileSync } from 'node:fs'",
+      `const marker = ${JSON.stringify(markerPath)}`,
+      "process.on('SIGTERM', () => process.exit(0))",
+      `const grandchild = spawn(process.execPath, ['--input-type=module', '-e', ${JSON.stringify(grandchildScript)}], { stdio: ['ignore', 'inherit', 'inherit'] })`,
+      'writeFileSync(marker, String(grandchild.pid))',
+      "process.stdout.write('http://127.0.0.1:1/\\n')",
+      'setInterval(() => {}, 1000)',
+    ].join(';')
+    let grandchildPid: number | undefined
+
+    try {
+      const web = await startOfficialWeb('/tmp', directory, {
+        command: process.execPath,
+        args: ['--input-type=module', '-e', script],
+        stopTimeoutMs: 300,
+      })
+      grandchildPid = Number(readFileSync(markerPath, 'utf8'))
+      const startedAt = Date.now()
+      const firstStop = web.stop()
+      expect(web.stop()).toBe(firstStop)
+      await withTimeout(firstStop, 1000)
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(150)
+      expect(readFileSync(donePath, 'utf8')).toBe('done')
+    } finally {
+      if (grandchildPid !== undefined) {
+        try {
+          process.kill(grandchildPid, 'SIGKILL')
+        } catch {
+          // The close assertion normally proves it already exited.
+        }
+      }
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects promptly on spawn error and does not wait for exit forever', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dsh-thinking-effort-spawn-error-'))
+    try {
+      await expect(withTimeout(startOfficialWeb('/tmp', directory, {
+        command: join(directory, 'missing-dsh-command'),
+        stopTimeoutMs: 50,
+      }), 1000)).rejects.toThrow(/ENOENT|spawn/)
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('uses SIGKILL when the child ignores SIGTERM after token failure', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dsh-thinking-effort-kill-'))
+    const markerPath = join(directory, 'child-pid')
+    const script = [
+      "import { writeFileSync } from 'node:fs'",
+      `const marker = ${JSON.stringify(markerPath)}`,
+      'writeFileSync(marker, String(process.pid))',
+      "process.on('SIGTERM', () => {})",
+      "process.stdout.write('http://127.0.0.1:1/?token=broken\\n')",
+      'setInterval(() => {}, 1000)',
+    ].join(';')
+    let childPid: number | undefined
+
+    try {
+      await expect(withTimeout(startOfficialWeb('/tmp', directory, {
+        command: process.execPath,
+        args: ['--input-type=module', '-e', script],
+        stopTimeoutMs: 50,
+      }), 1000)).rejects.toThrow()
+      childPid = Number(readFileSync(markerPath, 'utf8'))
+      expect(() => process.kill(childPid!, 0)).toThrow()
+    } finally {
+      if (childPid !== undefined) {
+        try {
+          process.kill(childPid, 'SIGKILL')
+        } catch {
+          // The process should already be gone after the bounded cleanup.
+        }
+      }
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('compatibility documentation and root validation', () => {
+  // The single Chinese `README` of this copy is a local adaptation note — where
+  // the source repository is, and what this copy changed — so the compatibility
+  // contract is carried by the install guides and the changelogs alone.
+  const compatibilityDocumentationFiles = [
+    'docs/INSTALL.md', 'docs/INSTALL.zh.md', 'docs/INSTALL.ja.md', 'docs/INSTALL.ko.md',
+  ] as const
+  const changelogFiles = [
+    'docs/CHANGELOG.md', 'docs/CHANGELOG.ja.md', 'docs/CHANGELOG.ko.md',
+  ] as const
+  const modelSourceConflictContract = /(?=[^\n]*(?:route|路由|ルート|라우트))(?=[^\n]*(?:provider|提供方|プロバイダー|제공자))(?=[^\n]*(?:non-empty|非空|비어 있지 않은))(?=[^\n]*models\[\])(?=[^\n]*modelOverrides)[^\n]*(?:invalid|无效|無効|잘못된)/i
+  const documentationContract = [
+    { name: 'DSH Runtime compatibility boundary', pattern: /DSH Runtime[^\n]*(?:compatibility|兼容|互換|호환)/i },
+    { name: 'Gateway Protocol compatibility boundary', pattern: /Gateway Protocol[^\n]*(?:compatibility|compat|兼容|互換|호환)/i },
+    { name: 'modern Settings transport', pattern: /remote\.settings/ },
+    { name: 'legacy Settings transport', pattern: /connection\.api\.settings/ },
+    { name: 'supportsDeveloperRole field', pattern: /supportsDeveloperRole/ },
+    { name: 'maxTokensField field', pattern: /maxTokensField/ },
+    { name: 'provider global compat example', pattern: /providers:\n  qwen-gateway:\n    compat:\n      supportsDeveloperRole: false\n      maxTokensField: max_tokens/ },
+    { name: 'model-level compat example', pattern: /- id: qwen-thinking\n        compat:\n          maxTokensField: max_completion_tokens/ },
+    { name: 'catalog model override path', pattern: /modelOverrides\.\<model\>\.compat/ },
+    { name: 'field-by-field provider override semantics', pattern: /(?:field-by-field|field by field|逐字段|フィールドごと|필드별)[^\n]*(?:provider|供应商|プロバイダー|제공자)/i },
+    { name: 'Auto restores provider inheritance', pattern: /Auto[^\n]*(?:delete|delet|unset|取消|删除|削除|삭제)[^\n]*(?:inherit|继承|継承|상속)/i },
+    { name: 'models and modelOverrides are mutually exclusive at provider scope', pattern: modelSourceConflictContract },
+    { name: 'models[] settings behavior', pattern: /models\[\][^\n]*(?:complete|完整|全体|全体|전체)[^\n]*(?:array set|数组 set|配列 set|배열 set)/i },
+    { name: 'schema rejects model source conflict', pattern: /(?=[^\n]*(?:official schema|官方 schema|公式 schema|공식 schema))(?=[^\n]*models\[\])[^\n]*(?:rejects|拒绝|拒否|거부)[^\n]*(?:fails? closed|异常数据|異常なデータ|비정상 데이터)/i },
+    { name: 'control plane and transport boundary', pattern: /(?:control plane|控制面|コントロールプレーン|제어면)[^\n]*(?:transport|传输|トランスポート|전송)/i },
+    { name: 'rc7 capability boundary', pattern: /0\.1\.0-rc\.7/ },
+    { name: 'rc8 and later capability boundary', pattern: /0\.1\.0-rc\.8[^\n]*(?:later|后续|以降|이후)/i },
+    { name: 'Auto reset semantics', pattern: /Auto[^\n]*(?:unset|取消|恢复|復元|복원)/i },
+    {
+      name: 'optional takeover semantics',
+      pattern: /(?=.*dsh-llm-openai-completions)(?=.*(?:optional|可选|オプション|선택))(?=.*(?:takeover|take over|接管))/is,
+    },
+  ] as const
+  const published013Sections = {
+    'docs/CHANGELOG.md': `## [0.1.13] - 按兼容范围验证 / Range-based compatibility verification\n\n### 变更 / Changed\n\n- 将兼容层的版本诊断从逐版本枚举改为范围判断，并让发布 workflow 每个兼容范围只选择一个官方代表版本。\n- Replace per-release compatibility enumeration with range-based version diagnostics, and make the release workflow select one official representative per compatibility range.`,
+    'docs/CHANGELOG.ja.md': `## [0.1.13] - 互換性範囲による検証\n\n### 変更\n\n- 互換アダプターのバージョン診断をリリース単位の列挙から範囲判定へ変更し、公開前 workflow は各範囲から公式代表バージョンを 1 つだけ選ぶようにしました。`,
+    'docs/CHANGELOG.ko.md': `## [0.1.13] - 호환성 범위 기반 검증\n\n### 변경\n\n- 호환성 어댑터의 버전 진단을 릴리스별 열거에서 범위 판정으로 변경하고, 게시 전 workflow가 각 범위에서 공식 대표 버전 하나만 선택하도록 했습니다.`,
+  } as const
+
+  const section = (document: string, heading: string): string => {
+    const start = document.indexOf(`## [${heading}]`)
+    if (start === -1) throw new Error(`missing changelog heading: ${heading}`)
+    const next = document.indexOf('\n## [', start + 1)
+    return document.slice(start, next === -1 ? document.length : next).trim()
+  }
+
+  it.each(compatibilityDocumentationFiles)('enforces the compatibility contract in %s', (file) => {
+    const document = readFileSync(join(root, file), 'utf8')
+    expect(existsSync(join(root, file))).toBe(true)
+    expect(document, `${file}: missing scoped package name`).toContain('@hytime/dsh-thinking-effort')
+    for (const { name, pattern } of documentationContract) {
+      expect(document, `${file}: missing ${name}`).toMatch(pattern)
+    }
+  })
+
+  it.each(changelogFiles)('enforces the changelog contract in %s', (file) => {
+    const document = readFileSync(join(root, file), 'utf8')
+    expect(existsSync(join(root, file))).toBe(true)
+    expect(document).toMatch(/version-map(?:\.ts)?/i)
+    expect(document).toMatch(/rc\.?7/i)
+    expect(document).toMatch(/rc\.?2/i)
+    expect(document).toMatch(/alpha\.?3/i)
+    expect(document).toMatch(/(?:optional|可选|オプション|선택)[^\n]*(?:takeover|take over|接管)/is)
+    expect(document).toContain('## [Unreleased]')
+    expect(section(document, '0.1.14')).toMatch(/version-map/i)
+    expect(section(document, '0.1.14')).toMatch(/rc\.?7/i)
+    expect(section(document, '0.1.14')).toMatch(/rc\.?2/i)
+    expect(section(document, '0.1.14')).toMatch(/alpha\.?3/i)
+    expect(section(document, '0.1.14')).toMatch(/takeover|take over|接管/i)
+    expect(section(document, '0.1.14')).toMatch(/provider[^\n]*compat|提供方[^\n]*compat|プロバイダー[^\n]*compat|provider[^\n]*호환/i)
+    expect(section(document, '0.1.14')).toMatch(/modelOverrides/)
+    expect(section(document, '0.1.14')).toMatch(/models\[\]/)
+    expect(section(document, '0.1.14')).toMatch(modelSourceConflictContract)
+    expect(section(document, '0.1.14')).toMatch(/(?:control plane|控制面|コントロールプレーン|제어면)[^\n]*(?:transport|传输|トランスポート|전송)/i)
+    expect(section(document, '0.1.13')).toBe(published013Sections[file])
+  })
+
+  it.each(['INSTALL.md', 'INSTALL.zh.md', 'CHANGELOG.md', 'CHANGELOG.ja.md', 'CHANGELOG.ko.md'] as const)(
+    'rejects the moved root documentation path %s',
+    (file) => {
+      expect(existsSync(join(root, file))).toBe(false)
+    },
+  )
+
+  it('documents capability detection as authoritative across published docs', () => {
+    for (const file of [...compatibilityDocumentationFiles, ...changelogFiles]) {
+      const document = readFileSync(join(root, file), 'utf8')
+      expect(document, `${file}: stale version-metadata preference`).not.toMatch(/prefers DSH version metadata/i)
+      expect(document, `${file}: stale Chinese version-metadata preference`).not.toMatch(/优先使用 DSH version metadata/i)
+    }
+  })
+
+  it('requires the English changelog to state that runtime capability detection is authoritative', () => {
+    const document = readFileSync(join(root, 'docs/CHANGELOG.md'), 'utf8')
+    expect(section(document, '0.1.14')).toMatch(/Runtime capability detection is authoritative/i)
+  })
+
+  it('keeps publish workflow roots aligned with loader verification order', () => {
+    const workflow = readFileSync(join(root, '.github/workflows/publish.yml'), 'utf8')
+    const roots = [
+      '"rc7:$RC7_ROOT:$RUN_ROOT/homes/rc7"',
+      '"rc2:$RC2_ROOT:$RUN_ROOT/homes/rc2"',
+      '"alpha:$ALPHA_ROOT:$RUN_ROOT/homes/alpha"',
+      '"namespace:$NAMESPACE_ROOT:$RUN_ROOT/homes/namespace"',
+      '"entry:$ENTRY_ROOT:$RUN_ROOT/homes/entry"',
+    ]
+    const rootSpecStart = workflow.indexOf('for spec in')
+    expect(rootSpecStart).toBeGreaterThanOrEqual(0)
+    let previous = rootSpecStart
+    for (const rootSpec of roots) {
+      const position = workflow.indexOf(rootSpec, previous)
+      expect(position, `publish workflow missing ordered root ${rootSpec}`).toBeGreaterThan(previous)
+      previous = position
+    }
+    expect(workflow).toContain('DSH_CLI_ROOTS="$RC7_ROOT,$RC2_ROOT,$ALPHA_ROOT,$NAMESPACE_ROOT,$ENTRY_ROOT"')
+    expect(expectedOfficialDshVersions).toEqual(['0.1.0-rc.7', '0.1.1-rc.2', '0.1.3-alpha.2', '0.1.6-alpha.1', '0.1.7-alpha.1'])
+  })
+
+  it('rejects duplicate normalized DSH CLI roots', () => {
+    const duplicateRoots = `${root},${join(root, '.')},${root},${root},${root}`
+
+    expect(() => parseCliRoots(duplicateRoots)).toThrow(/distinct|unique/i)
+  })
+
+  it('rejects a root list that does not cover all five official representatives', () => {
+    const fourRoots = `${root},${join(root, '.')},${root},${root}`
+
+    expect(() => parseCliRoots(fourRoots)).toThrow(/exactly five/)
+  })
+})
+
+describe('optional openai-completions takeover contract', () => {
+  it('identifies custom thinking providers from shared llm-pi-ai fields', () => {
+    expect(identifyTakeoverProviders({
+      providers: {
+        local: {
+          api: 'openai-completions',
+          baseURL: 'http://gateway.test/v1',
+          models: [{
+            id: 'model',
+            reasoningEfforts: { off: null, high: 'high' },
+            compat: { thinkingFormat: 'qwen', supportsReasoningEffort: false },
+          }],
+        },
+        official: {
+          api: 'openai-completions',
+          baseURL: 'https://api.openai.com/v1',
+          models: [{ id: 'model', reasoningEfforts: { high: 'high' } }],
+        },
+      },
+    }, capabilitiesForVersion('0.1.1-rc.2'))).toEqual(['local'])
+    expect(identifyTakeoverProviders({
+      providers: {
+        local: {
+          api: 'openai-completions',
+          baseURL: 'http://gateway.test/v1',
+          models: [{ id: 'model', reasoningEfforts: { high: 'high' } }],
+        },
+      },
+    }, capabilitiesForVersion('0.1.0-rc.7'))).toEqual([])
+    expect(identifyTakeoverProviders({
+      providers: {
+        local: { api: 'openai-completions', baseURL: 'http://gateway.test/v1', models: [{ id: 'model', reasoningEfforts: { high: 'high' } }] },
+      },
+    })).toEqual([])
+    expect(isCustomOpenAiGateway({ api: 'openai-completions', baseURL: 'https://api.openai.com/v1' })).toBe(false)
+    expect(isCustomOpenAiGateway({ api: 'openai-completions' })).toBe(false)
+    expect(isCustomOpenAiGateway({ api: 'openai-completions', baseURL: 'http://gateway.test/v1' })).toBe(true)
+  })
+
+  it('returns null for an absent takeover namespace and never requires it', () => {
+    expect(takeoverProvidersOf(undefined)).toBeNull()
+    expect(takeoverProvidersOf({ enabled: true, providers: ['local'] })).toEqual(['local'])
+  })
+})
+
+describe('published package composition', () => {
+  it('exposes built Host and Client artifacts with declarations', () => {
+    const manifest = readPackage()
+
+    expect(manifest.version).toBe('0.4.0')
+    expect(manifest.main).toBe('./lib/index.js')
+    expect(manifest.types).toBe('./lib/types/index.d.ts')
+    expect(manifest.exports['.']).toEqual({
+      types: './lib/types/index.d.ts',
+      default: './lib/index.js',
+    })
+    expect(manifest.exports['./client']).toEqual({
+      types: './lib/types/client/index.d.ts',
+      default: './lib/client.js',
+    })
+    expect(manifest.dsh?.client).toEqual({
+      inject: [
+        '@deepseek-ai/dsh-client-connection',
+        '@deepseek-ai/dsh-client-locale',
+        '@deepseek-ai/dsh-client-ui-settings',
+        '@deepseek-ai/dsh-api-remotes',
+      ],
+      platform: 'web',
+    })
+    expect(manifest.files).toContain('lib/index.js')
+    expect(manifest.files).toContain('lib/client.js')
+    expect(manifest.files).toContain('lib/types/**/*.d.ts')
+    expect(manifest.files).toContain('cordis.patch.yml')
+    for (const documentationFile of [
+      'README.md',
+      'docs/INSTALL.md', 'docs/INSTALL.zh.md', 'docs/INSTALL.ja.md', 'docs/INSTALL.ko.md', 'docs/SCREENSHOTS.md',
+      'docs/CHANGELOG.md', 'docs/CHANGELOG.ja.md', 'docs/CHANGELOG.ko.md',
+    ]) {
+      expect(manifest.files).toContain(documentationFile)
+    }
+    // This copy ships one Chinese README; the per-language mirrors are gone, so
+    // an accidental re-add would publish files that no longer exist.
+    for (const retiredFile of ['README.zh.md', 'README.ja.md', 'README.ko.md']) {
+      expect(manifest.files).not.toContain(retiredFile)
+    }
+    expect(manifest.files).not.toContain('INSTALL.md')
+    expect(manifest.files).not.toContain('INSTALL.zh.md')
+    expect(manifest.files).not.toContain('CHANGELOG.md')
+    expect(manifest.files).not.toContain('CHANGELOG.ja.md')
+    expect(manifest.files).not.toContain('CHANGELOG.ko.md')
+    expect(manifest.files).toContain('docs/assets/')
+  })
+})
+
+describe('loader seed schema contract', () => {
+  it('uses only official openai-completions compat fields', () => {
+    for (const model of loaderSeedProvider.models) {
+      const compat = 'compat' in model ? model.compat : undefined
+      for (const field of Object.keys(compat ?? {})) {
+        expect(officialSeedCompatFields.has(field), `unsupported seed compat field: ${field}`).toBe(true)
+      }
+    }
+  })
+})
+
+integrationDescribe('official DSH loader composition', () => {
+  it('requires and verifies the four namespace-model hosts independently', { timeout: 300000 }, async () => {
+    expect(cliRoots).toHaveLength(5)
+    expect(cliRoots.every((cliRoot) => cliRoot === resolve(cliRoot))).toBe(true)
+    expect(new Set(cliRoots).size).toBe(5)
+    expect(officialRoots.map(({ version }) => version)).toEqual(expectedOfficialDshVersions)
+    expect(namespaceRoots).toHaveLength(4)
+    expect(entryConfigRoots).toHaveLength(1)
+
+    for (const { cliRoot, version } of namespaceRoots) {
+      const home = mkdtempSync(join(tmpdir(), 'dsh-thinking-effort-loader-'))
+      const packDestination = mkdtempSync(join(tmpdir(), 'dsh-thinking-effort-pack-'))
+      const profile = join(home, 'profiles', 'compat')
+      try {
+        expect(existsSync(profile)).toBe(false)
+    const tarball = packLocalPackage(packDestination)
+
+    runOfficialDsh(cliRoot, home, ['plugin', '--profile', 'compat', 'add', tarball])
+
+    const profileManifest = JSON.parse(readFileSync(join(profile, 'package.json'), 'utf8')) as {
+      dependencies?: Record<string, string>
+    }
+    expect(profileManifest.dependencies?.['@hytime/dsh-thinking-effort']).toBeDefined()
+    expect(profileManifest.dependencies?.['dsh-thinking-effort']).toBeUndefined()
+
+    const dump = runOfficialDsh(cliRoot, home, ['--profile', 'compat', '--dump-default-config'])
+    expect(dump).toContain('id: thinking-effort')
+    expect(dump).toContain("name: '@hytime/dsh-thinking-effort'")
+    expect(dump).not.toContain('name: dsh-thinking-effort')
+
+    const installedDir = join(profile, 'node_modules', '@hytime', 'dsh-thinking-effort')
+    const installedManifest = JSON.parse(readFileSync(join(installedDir, 'package.json'), 'utf8')) as PackageManifest
+    expect(installedManifest.name).toBe('@hytime/dsh-thinking-effort')
+    expect(installedManifest.version).toBe('0.4.0')
+
+    const hostEntry = join(installedDir, 'lib', 'index.js')
+    const clientEntry = join(installedDir, 'lib', 'client.js')
+    expect(existsSync(hostEntry)).toBe(true)
+    expect(existsSync(clientEntry)).toBe(true)
+
+         const hostCode = readFileSync(hostEntry, 'utf8')
+     // `Config` joined the entry's exports when the 0.1.7 form started deriving
+     // from it, so the whole named-export list is asserted rather than the three
+     // legacy names alone: a build that stopped exporting `Config` would leave
+     // every entry-config host with no settings form at all, which is the
+     // regression this matrix exists to catch.
+     const hostExports = /export \{ ([^}]+) \}/.exec(hostCode)?.[1]
+       ?.split(',').map((exported) => exported.trim()).sort()
+     expect(hostExports).toEqual(['Config', 'apply', 'inject', 'name'])
+
+    const clientCode = readFileSync(clientEntry, 'utf8')
+    const registered: Array<{
+       id?: string
+       factory?: (require: (specifier: string) => unknown) => Record<string, unknown>
+     }> = []
+    const webHome = mkdtempSync(join(tmpdir(), 'dsh-thinking-effort-web-'))
+    try {
+      runOfficialDsh(cliRoot, webHome, ['plugin', '--profile', 'web', 'add', tarball])
+      const web = await startOfficialWeb(cliRoot, webHome, {
+        args: version === '0.1.0-rc.7'
+          ? ['dsh', '--profile', 'web', '--port', '0']
+          : ['dsh', '--profile', 'web', '--no-open', '--port', '0'],
+      })
+      try {
+        const headers: Record<string, string> = web.cookie === '' ? {} : { cookie: web.cookie }
+        const legacyRpc = version === '0.1.1-rc.2' || version === '0.1.0-rc.7'
+        const describeEndpoint = legacyRpc ? 'settings.describe' : 'settings/describe'
+        const mutateEndpoint = legacyRpc ? 'settings.mutate' : 'settings/mutate'
+        const settingsDescribe = await callOfficialRpc(web.url, headers, describeEndpoint, {}, !legacyRpc)
+        expect(settingsDescribe.status).toBe(200)
+         const webMarkerPath = join(webHome, 'thinking-effort-loaded.json')
+         expect(existsSync(webMarkerPath)).toBe(true)
+         const webMarker = JSON.parse(readFileSync(webMarkerPath, 'utf8')) as {
+           event?: string
+           name?: string
+           at?: string
+           pid?: number
+         }
+         expect(webMarker).toMatchObject({ event: 'apply', name: '@hytime/dsh-thinking-effort' })
+         expect(webMarker.at).toEqual(expect.any(String))
+         expect(webMarker.pid).toEqual(expect.any(Number))
+         const liveResult = (endpoint: string, args: Record<string, unknown>): Promise<unknown> => (
+          callOfficialRpc(web.url, headers, endpoint, args, !legacyRpc).then((response) => (
+            legacyRpc ? { result: response.body.result } : response.body.result
+          ))
+        )
+        const settings = legacyRpc
+          ? settingsBridge({ api: { settings: {
+            describe: () => liveResult(describeEndpoint, {}),
+            mutate: (args: { ns: string; ops: readonly import('../src/client/types.js').SettingsOp[]; expectedRevision: number }) => liveResult(mutateEndpoint, args),
+          } } })
+          : settingsBridge(undefined, {
+            describe: () => liveResult(describeEndpoint, {}),
+            mutate: (ns: string, ops: readonly import('../src/client/types.js').SettingsOp[], expectedRevision: number) => liveResult(mutateEndpoint, { ns, ops, expectedRevision }),
+           })
+
+        expect(settings).toBeDefined()
+        const liveDescription = await settings!.describe()
+         expect(liveDescription).toMatchObject({ ok: true, value: { namespaces: expect.any(Array) } })
+         if (!liveDescription.ok) throw new Error(liveDescription.error.message)
+         const piAiNamespace = liveDescription.value.namespaces.find(({ ns }) => ns === 'llm-pi-ai')
+         expect(piAiNamespace).toBeDefined()
+         const sessionNamespace = liveDescription.value.namespaces.find(({ ns }) => ns === 'dsh-thinking-effort')
+         expect(sessionNamespace).toBeDefined()
+         if (sessionNamespace === undefined) throw new Error(`missing dsh-thinking-effort namespace for ${version}`)
+         const sessionRoute = `loader-opencode-${version.replaceAll('.', '-')}`
+         const sessionPath = ['opencodeSession', 'providers', sessionRoute, 'models', 'deepseek-v4-flash']
+         const sessionEnabled = await settings!.mutate(sessionNamespace.ns, [{ op: 'set', path: sessionPath, value: true }], sessionNamespace.revision)
+         expect(sessionEnabled).toMatchObject({ ok: true, value: { ns: 'dsh-thinking-effort' } })
+         if (!sessionEnabled.ok) throw new Error(`OpenCode session enable rejected for ${version}: ${sessionEnabled.error.message}`)
+         const enabledDescription = await settings!.describe()
+         const enabledSession = enabledDescription.ok
+           ? enabledDescription.value.namespaces.find(({ ns }) => ns === 'dsh-thinking-effort')
+           : undefined
+         expect((enabledSession?.value as Record<string, unknown> | undefined)).toMatchObject({
+           opencodeSession: {
+             providers: {
+               [sessionRoute]: { models: { 'deepseek-v4-flash': true } },
+             },
+           },
+         })
+         if (enabledSession === undefined) throw new Error(`missing enabled dsh-thinking-effort namespace for ${version}`)
+         const sessionDisabled = await settings!.mutate(enabledSession.ns, [{ op: 'unset', path: sessionPath }], enabledSession.revision)
+         expect(sessionDisabled).toMatchObject({ ok: true, value: { ns: 'dsh-thinking-effort' } })
+         if (!sessionDisabled.ok) throw new Error(`OpenCode session disable rejected for ${version}: ${sessionDisabled.error.message}`)
+         const disabledDescription = await settings!.describe()
+         const disabledSession = disabledDescription.ok
+           ? disabledDescription.value.namespaces.find(({ ns }) => ns === 'dsh-thinking-effort')
+           : undefined
+         const disabledValue = disabledSession?.value as Record<string, unknown> | undefined
+          const disabledProviders = (disabledValue?.opencodeSession as Record<string, unknown> | undefined)?.providers as Record<string, unknown> | undefined
+          const disabledModels = (disabledProviders?.[sessionRoute] as Record<string, unknown> | undefined)?.models as Record<string, unknown> | undefined
+          expect(disabledModels ?? {}).not.toHaveProperty('deepseek-v4-flash')
+          expect(Object.values(disabledModels ?? {}).some(value => value === true)).toBe(false)
+         if (disabledSession === undefined) throw new Error(`missing disabled dsh-thinking-effort namespace for ${version}`)
+         const mapped = capabilitiesForVersion(version)
+         expect(mapped).toBeDefined()
+         const editability = editableProviderCompatFields(mapped, piAiNamespace?.schema)
+         if (version === '0.1.0-rc.7') {
+           // rc7 exposes no gateway compat fields: the availability map is
+           // sparse (only editable fields appear as `true`), so both keys must
+           // be absent and editableFields empty.
+           expect(editability.editableFields).toEqual([])
+           expect(editability.supportsDeveloperRole).toBeUndefined()
+           expect(editability.maxTokensField).toBeUndefined()
+         } else {
+           expect(editability.supportsDeveloperRole).toBe(true)
+           expect(editability.maxTokensField).toBe(true)
+         }
+
+         const describePiAi = async (): Promise<{
+           ns: string
+           revision: number
+           value: Record<string, unknown>
+         }> => {
+           const result = await settings!.describe()
+           expect(result).toMatchObject({ ok: true, value: { namespaces: expect.any(Array) } })
+           if (!result.ok) throw new Error(result.error.message)
+           const current = result.value.namespaces.find(({ ns }) => ns === 'llm-pi-ai')
+           expect(current).toBeDefined()
+           expect(current?.revision).toEqual(expect.any(Number))
+           return { ns: current!.ns, revision: current!.revision, value: current!.value }
+         }
+         const current = await describePiAi()
+         if (version === '0.1.0-rc.7') {
+           const blockedOps = opsForProviderCompat('loader-compat', {
+             supportsDeveloperRole: 'supported',
+             maxTokensField: 'max_completion_tokens',
+           }, editability)
+           expect(blockedOps).toEqual([])
+           expect((await describePiAi()).revision).toBe(current.revision)
+         } else {
+           const route = `loader-compat-${version.replaceAll('.', '-')}`
+            // DSH materializes the compat fields it declares. 0.1.1-rc.2 predates
+            // chatTemplateArgs; every newer representative exposes both.
+            const defaultCompat = version === '0.1.1-rc.2'
+              ? { chatTemplateKwargs: {} }
+              : { chatTemplateArgs: {}, chatTemplateKwargs: {} }
+           const seeded = await settings!.mutate(current.ns, [{
+             op: 'set',
+             path: ['providers', route],
+             value: {
+               api: 'openai-completions',
+               baseURL: 'http://gateway.test/v1',
+               models: [
+                  { id: 'loader-model-a', reasoningEfforts: { off: null, high: 'high' }, custom: 'keep-a' },
+                  { id: 'loader-model-b', reasoningEfforts: { off: null, high: 'high' }, custom: 'keep-b', compat: { maxTokensField: 'max_tokens', supportsStore: true } },
+                ],
+             },
+           }], current.revision)
+
+           if (!seeded.ok) throw new Error(`settings seed rejected for ${version}: ${seeded.error.message}`)
+            expect(seeded).toMatchObject({ ok: true, value: { ns: 'llm-pi-ai' } })
+
+           const seededNamespace = await describePiAi()
+           const setOps = opsForProviderCompat(route, {
+             supportsDeveloperRole: 'supported',
+             maxTokensField: 'max_completion_tokens',
+           }, editability)
+           expect(setOps).toEqual([
+             { op: 'set', path: ['providers', route, 'compat', 'supportsDeveloperRole'], value: true },
+             { op: 'set', path: ['providers', route, 'compat', 'maxTokensField'], value: 'max_completion_tokens' },
+           ])
+           const written = await settings!.mutate(seededNamespace.ns, setOps, seededNamespace.revision)
+           expect(written).toMatchObject({ ok: true, value: { ns: 'llm-pi-ai' } })
+           if (!written.ok) throw new Error(written.error.message)
+           const writtenNamespace = await describePiAi()
+           const writtenProviders = writtenNamespace.value.providers as Record<string, Record<string, unknown>>
+           expect(writtenProviders[route]?.compat).toMatchObject({
+             supportsDeveloperRole: true,
+             maxTokensField: 'max_completion_tokens',
+   })
+
+           const unsetOps = opsForProviderCompat(route, {
+             supportsDeveloperRole: 'auto',
+             maxTokensField: 'auto',
+           }, editability)
+           expect(unsetOps).toEqual([
+             { op: 'unset', path: ['providers', route, 'compat', 'supportsDeveloperRole'] },
+             { op: 'unset', path: ['providers', route, 'compat', 'maxTokensField'] },
+           ])
+           const cleared = await settings!.mutate(writtenNamespace.ns, unsetOps, writtenNamespace.revision)
+           expect(cleared).toMatchObject({ ok: true, value: { ns: 'llm-pi-ai' } })
+           if (!cleared.ok) throw new Error(cleared.error.message)
+           const clearedNamespace = await describePiAi()
+           const clearedProviders = clearedNamespace.value.providers as Record<string, Record<string, unknown>>
+           const clearedCompat = clearedProviders[route]?.compat as Record<string, unknown> | undefined
+            expect(clearedCompat?.supportsDeveloperRole).toBeUndefined()
+            expect(clearedCompat?.maxTokensField).toBeUndefined()
+
+            const modelsNamespace = await describePiAi()
+            const modelsInventory = inventoryFrom({ value: modelsNamespace.value })
+            const targetModel = modelsInventory.find((candidate) => candidate.route === route && candidate.model === 'loader-model-b')
+            expect(targetModel).toBeDefined()
+            const modelSetOps = opsForModelArrayCompat(modelsInventory, targetModel!, {
+              supportsDeveloperRole: 'unsupported',
+            }, editability)
+            expect(modelSetOps).toEqual([{
+              op: 'set',
+              path: ['providers', route, 'models'],
+              value: [
+                { id: 'loader-model-a', reasoningEfforts: { off: null, high: 'high' }, input: [], custom: 'keep-a', compat: defaultCompat },
+                { id: 'loader-model-b', reasoningEfforts: { off: null, high: 'high' }, input: [], custom: 'keep-b', compat: { ...defaultCompat, maxTokensField: 'max_tokens', supportsStore: true, supportsDeveloperRole: false } },
+              ],
+            }])
+            const modelWritten = await settings!.mutate(modelsNamespace.ns, modelSetOps, modelsNamespace.revision)
+            expect(modelWritten).toMatchObject({ ok: true, value: { ns: 'llm-pi-ai' } })
+            if (!modelWritten.ok) throw new Error(modelWritten.error.message)
+            const modelWrittenNamespace = await describePiAi()
+            const modelWrittenProfile = (modelWrittenNamespace.value.providers as Record<string, Record<string, unknown>>)[route]
+            expect(modelWrittenProfile?.models).toEqual(modelSetOps[0]?.value)
+
+            const modelAfterSet = inventoryFrom({ value: modelWrittenNamespace.value }).find((candidate) => candidate.route === route && candidate.model === 'loader-model-b')
+            expect(modelAfterSet).toBeDefined()
+            const modelAutoOps = opsForModelArrayCompat(inventoryFrom({ value: modelWrittenNamespace.value }), modelAfterSet!, {
+              supportsDeveloperRole: 'auto',
+            }, editability)
+            expect(modelAutoOps).toEqual([{
+              op: 'set',
+              path: ['providers', route, 'models'],
+              value: [
+                { id: 'loader-model-a', reasoningEfforts: { off: null, high: 'high' }, input: [], custom: 'keep-a', compat: defaultCompat },
+                { id: 'loader-model-b', reasoningEfforts: { off: null, high: 'high' }, input: [], custom: 'keep-b', compat: { ...defaultCompat, maxTokensField: 'max_tokens', supportsStore: true } },
+              ],
+            }])
+            const modelCleared = await settings!.mutate(modelWrittenNamespace.ns, modelAutoOps, modelWrittenNamespace.revision)
+            expect(modelCleared).toMatchObject({ ok: true, value: { ns: 'llm-pi-ai' } })
+            if (!modelCleared.ok) throw new Error(modelCleared.error.message)
+            const modelClearedNamespace = await describePiAi()
+            const modelClearedProfile = (modelClearedNamespace.value.providers as Record<string, Record<string, unknown>>)[route]
+            expect(modelClearedProfile?.models).toEqual(modelAutoOps[0]?.value)
+           expect(clearedCompat?.supportsDeveloperRole).toBeUndefined()
+           expect(clearedCompat?.maxTokensField).toBeUndefined()
+         }
+
+
+
+
+
+         const indexResponse = await fetch(web.url, {
+          headers,
+          signal: AbortSignal.timeout(10000),
+
+        })
+         expect(indexResponse.status).toBe(200)
+        const indexHtml = await indexResponse.text()
+        const bootRows = extractBootRows(indexHtml)
+        const bundleUrl = extractBundleUrl(indexHtml, '@hytime/dsh-thinking-effort')
+        expect(bundleUrl).toMatch(/\/plugins\/(?:\?\?@hytime\/dsh-thinking-effort\/client\.js&rev=|@hytime\/dsh-thinking-effort\/client\.js\?rev=)/)
+        const response = await fetch(new URL(bundleUrl, web.url), {
+          headers,
+          signal: AbortSignal.timeout(10000),
+
+        })
+         expect(response.status).toBe(200)
+        const servedCode = await response.text()
+        expect(servedCode).toContain(clientCode)
+        expect(servedCode).toContain("id: '@hytime/dsh-thinking-effort'")
+        runInNewContext(servedCode, {
+          window: {
+            __ModuleLoader__: {
+              load(entry: { id?: string; factory?: typeof registered[number]['factory'] }) {
+                registered.push(entry)
+              },
+            },
+          },
+
+        })
+        // The real-browser DOM probe validates client-side rendering of the
+        // settings section. The client bundle is identical across the
+        // representative DSH versions, so launch Playwright on the
+        // namespace-model representative (0.1.6-alpha.1) and on the
+        // entry-config representative (0.1.7-alpha.1, in its own case below)
+        // while keeping the RPC/profile/写入 verification for every version,
+        // which needs no browser.
+        if (version === '0.1.6-alpha.1') {
+          await assertSettingsDomProbe(cliRoot, web, `bootRows=${JSON.stringify(bootRows)}`)
+        }
+      } finally {
+        await web.stop()
+      }
+    } finally {
+      rmSync(webHome, { recursive: true, force: true })
+    }
+    const packagedFactory = registered[0]?.factory
+    if (packagedFactory === undefined) throw new Error('served client bundle did not expose a factory')
+    const packagedRequire = createRequire(clientEntry)
+    const officialWebRequire = createRequire(join(cliRoot, 'apps/web/package.json'))
+    const packagedClient = packagedFactory((specifier) => {
+      try {
+        return packagedRequire(specifier)
+      } catch {
+        return officialWebRequire(specifier)
+      }
+    })
+    const runtimeProbe = await probeOfficialClientRuntime(cliRoot, packagedClient)
+    const previousHome = process.env.DSH_HOME
+    // This is a packaged-artifact probe in a manually assembled real Cordis
+    // Context. Official Loader activation is asserted by the Web marker and
+    // Settings RPC above.
+    const handMountedProbe = await probePackagedArtifactHandMountedRuntime(cliRoot, hostEntry)
+    expect(process.env.DSH_HOME).toBe(previousHome)
+    expect(handMountedProbe.withoutProduct).toMatchObject({
+      requestCount: 1,
+      reasoningEffort: 'low',
+      origin: 'subagent',
+      turnEnd: 'turn/end',
+    })
+    expect(handMountedProbe.withProduct).toMatchObject({
+      requestCount: 1,
+      reasoningEffort: 'low',
+      origin: 'subagent',
+      turnEnd: 'turn/end',
+    })
+         const baselineRecords = handMountedProbe.outbound.baseline
+     const productRecords = handMountedProbe.outbound.product
+     expect(baselineRecords).toHaveLength(1)
+     expect(productRecords).toHaveLength(3)
+     const enabledRequest = productRecords.find(({ options }) => options.provider === 'probe' && options.model === 'model-a')
+     const siblingRequest = productRecords.find(({ options }) => options.provider === 'probe' && options.model === 'model-b')
+     const otherProviderRequest = productRecords.find(({ options }) => options.provider === 'other' && options.model === 'model-a')
+     expect(enabledRequest?.wire).toBeDefined()
+     expect(siblingRequest?.wire).toBeDefined()
+     expect(otherProviderRequest?.wire).toBeDefined()
+     expect(enabledRequest?.wire?.url).toBe('http://gateway.test/v1/chat/completions')
+     // The default generator derives a `ses_` value bound to the DSH session
+     // rather than forwarding the raw id; assert the shape and that the suffix
+     // is a pure function of that session id (the hex block is minted per run).
+     const sessionHeader = enabledRequest?.wire?.headers['x-opencode-session']
+     expect(sessionHeader).toMatch(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
+     const normalizedSessionId = normalizeSessionIdForLoaderProbe(String(enabledRequest?.options.sessionId ?? ''))
+     expect(sessionHeader?.slice(16)).toBe(digestTail62ForLoaderProbe(normalizedSessionId))
+     expect(siblingRequest?.wire?.headers['x-opencode-session']).toBeUndefined()
+     expect(otherProviderRequest?.wire?.headers['x-opencode-session']).toBeUndefined()
+           const withoutMessageIds = (value: unknown): unknown => Array.isArray(value)
+        ? value.map(withoutMessageIds)
+        : value !== null && typeof value === 'object'
+          ? Object.fromEntries(Object.entries(value as Record<string, unknown>)
+            .filter(([key]) => key !== 'id')
+            .map(([key, nested]) => [key, withoutMessageIds(nested)]))
+          : value
+      expect(withoutMessageIds(JSON.parse(enabledRequest?.wire?.body ?? '{}')))
+        .toEqual(withoutMessageIds(JSON.parse(baselineRecords[0]?.wire.body ?? '{}')))
+     expect(enabledRequest?.wire?.url).toBe(baselineRecords[0]?.wire.url)
+     expect(JSON.parse(enabledRequest?.wire?.body ?? '{}').api).toBe('openai-completions')
+     expect({
+       provider: enabledRequest?.options.provider,
+       model: enabledRequest?.options.model,
+       reasoningEffort: enabledRequest?.options.reasoningEffort,
+       messages: withoutMessageIds(enabledRequest?.options.messages),
+        system: enabledRequest?.options.system,
+        tools: enabledRequest?.options.tools,
+        temperature: enabledRequest?.options.temperature,
+        maxTokens: enabledRequest?.options.maxTokens,
+        stop: enabledRequest?.options.stop,
+        purpose: enabledRequest?.options.purpose,
+        hasSignal: enabledRequest?.options.hasSignal,
+     }).toEqual({
+       provider: baselineRecords[0]?.options.provider,
+       model: baselineRecords[0]?.options.model,
+       reasoningEffort: baselineRecords[0]?.options.reasoningEffort,
+       messages: withoutMessageIds(baselineRecords[0]?.options.messages),
+        system: baselineRecords[0]?.options.system,
+        tools: baselineRecords[0]?.options.tools,
+        temperature: baselineRecords[0]?.options.temperature,
+        maxTokens: baselineRecords[0]?.options.maxTokens,
+        stop: baselineRecords[0]?.options.stop,
+        purpose: baselineRecords[0]?.options.purpose,
+        hasSignal: baselineRecords[0]?.options.hasSignal,
+     })
+     expect(existsSync(handMountedProbe.settingsHome)).toBe(false)
+    expect(existsSync(handMountedProbe.settingsPath)).toBe(false)
+    expect(existsSync(handMountedProbe.handMountedMarkerPath)).toBe(false)
+    expect(handMountedProbe.handMountedMarker).toMatchObject({ event: 'apply', name: '@hytime/dsh-thinking-effort' })
+    if (runtimeProbe.modern.supportsExternalLanguages) {
+      expect(runtimeProbe.modern.languages).toEqual(expect.arrayContaining(['ja', 'ko']))
+    } else {
+      expect(runtimeProbe.modern.languages).not.toContain('ja')
+      expect(runtimeProbe.modern.languages).not.toContain('ko')
+    }
+    expect(runtimeProbe.modern.sectionIds).toContain('thinking-effort')
+    if (runtimeProbe.legacy.supportsExternalLanguages) {
+      expect(runtimeProbe.legacy.languages).toEqual(expect.arrayContaining(['ja', 'ko']))
+    } else {
+      expect(runtimeProbe.legacy.languages).not.toContain('ja')
+      expect(runtimeProbe.legacy.languages).not.toContain('ko')
+    }
+    expect(runtimeProbe.legacy.sectionIds).toContain('thinking-effort')
+    expect(registered).toHaveLength(1)
+    expect(registered[0]?.id).toBe('@hytime/dsh-thinking-effort')
+      expect(typeof registered[0]?.factory).toBe('function')
+      } finally {
+        rmSync(home, { recursive: true, force: true })
+        rmSync(packDestination, { recursive: true, force: true })
+      }
+    }
+  })
+
+  /**
+   * The entry-config case. 0.1.7 derives a plugin's settings form from the
+   * Loader entry's own `Config`, so `settings.register` no longer exists; a
+   * plugin that still called it never reached `apply` and published no section
+   * at all — the regression this plan exists to prevent. This case asserts the
+   * two halves a published form needs: the Loader applied the entry (marker),
+   * and `settings/describe` lists the entry id with exactly the fields of the
+   * exported `Config`.
+   *
+   * It also holds the two host behaviours the provider-defaults fill reads
+   * (documented on `readUserLayer` in `src/host/settings.ts`), neither of which
+   * any in-process test can observe:
+   *
+   * 1. `llm-pi-ai`'s `providers` stays volatile. It is the entry's only field,
+   *    and `describe()` lists an entry only when some volatile field makes its
+   *    form live (`volatileForm` returns `undefined` otherwise), so dropping
+   *    that `.volatile()` removes the entry from the service reads entirely and
+   *    the fill goes dead rather than inflating. The check asserts the entry is
+   *    listed *and* that a path under `providers` is accepted, which the host
+   *    refuses for a non-volatile path.
+   * 2. A path write is derived from the raw user layer, not from a resolved
+   *    snapshot. Two writes cover it. The provider-array half writes one
+   *    minimal route and then a second field on that route, and requires the
+   *    user layer to hold exactly what those two writes stated: a
+   *    resolved-derived write would carry the route back materialized
+   *    (`models[].input`, `models[].compat`, `modelOverrides`, `headers`,
+   *    `defaultContextWindow` …). The defaults half writes one minimal path
+   *    into this plugin's own section and requires the user layer to hold
+   *    exactly that path; the resolved value necessarily carries
+   *    `opencodeSession` (with its `format` and `userAgent` defaults),
+   *    `profiles` and `autoBackup`, so a resolved-derived write would pin all
+   *    four into the user's document — exactly the inflation this plan removed.
+   */
+  it('loads on the entry-config host and publishes its settings section', { timeout: 300000 }, async () => {
+    expect(entryConfigRoots).toHaveLength(1)
+    const [entryConfigRoot] = entryConfigRoots
+    if (entryConfigRoot === undefined) throw new Error('DSH_CLI_ROOTS did not contain an entry-config root')
+    const { cliRoot, version } = entryConfigRoot
+    expect(version).toBe('0.1.7-alpha.1')
+
+    const home = mkdtempSync(join(tmpdir(), 'dsh-thinking-effort-entry-'))
+    // The Web profile gets its own home, as the namespace loop does: a marker
+    // read from the compat home could have been written by the compat profile
+    // rather than by the Web host this case asserts.
+    const webHome = mkdtempSync(join(tmpdir(), 'dsh-thinking-effort-entry-web-'))
+    const packDestination = mkdtempSync(join(tmpdir(), 'dsh-thinking-effort-pack-'))
+    try {
+      const tarball = packLocalPackage(packDestination)
+
+      runOfficialDsh(cliRoot, home, ['plugin', '--profile', 'compat', 'add', tarball])
+      const dump = runOfficialDsh(cliRoot, home, ['--profile', 'compat', '--dump-default-config'])
+      expect(dump).toContain(`id: ${PLUGIN_ENTRY_ID}`)
+      expect(dump).toContain("name: '@hytime/dsh-thinking-effort'")
+      expect(dump).not.toContain('name: dsh-thinking-effort')
+
+      runOfficialDsh(cliRoot, webHome, ['plugin', '--profile', 'web', 'add', tarball])
+      const web = await startOfficialWeb(cliRoot, webHome, {
+        args: ['dsh', '--profile', 'web', '--no-open', '--port', '0'],
+      })
+      try {
+        const headers: Record<string, string> = web.cookie === '' ? {} : { cookie: web.cookie }
+        const liveResult = (endpoint: string, args: Record<string, unknown>): Promise<unknown> => (
+          callOfficialRpc(web.url, headers, endpoint, args, true).then((response) => {
+            expect(response.status).toBe(200)
+            return response.body.result
+          })
+        )
+        const readNamespaces = async (): Promise<readonly EntryConfigNamespaceView[]> => {
+          // The RPC result is the service's `{ ok, value }` envelope, exactly as
+          // `settingsBridge` reads it in the namespace loop above.
+          const described = await liveResult('settings/describe', {}) as
+            | { readonly ok?: boolean; readonly value?: { readonly namespaces?: readonly EntryConfigNamespaceView[] } }
+            | undefined
+          expect(described).toMatchObject({ ok: true, value: { namespaces: expect.any(Array) } })
+          return described?.value?.namespaces ?? []
+        }
+
+        // The Host publishes the section; the Web host must also serve the
+        // Client bundle that renders it, or nothing reaches the browser. This
+        // is the half the namespace loop checks for its roots and the half a
+        // 0.1.7 Web host could break on its own (boot-graph entry, plugin asset
+        // route) without the RPC reads noticing.
+        const webInstalled = join(webHome, 'profiles', 'web', 'node_modules', '@hytime', 'dsh-thinking-effort')
+        const clientEntry = join(webInstalled, 'lib', 'client.js')
+        expect(existsSync(clientEntry)).toBe(true)
+        const clientCode = readFileSync(clientEntry, 'utf8')
+        const indexResponse = await fetch(web.url, { headers, signal: AbortSignal.timeout(10000) })
+        expect(indexResponse.status).toBe(200)
+        const indexHtml = await indexResponse.text()
+        const bootRows = extractBootRows(indexHtml)
+        const bundleUrl = extractBundleUrl(indexHtml, '@hytime/dsh-thinking-effort')
+        // 0.1.6 advertises this entry as a root-absolute URL and 0.1.7 as a
+        // page-relative one, so the leading slash is optional here; both are
+        // resolved against the served origin below either way.
+        expect(bundleUrl).toMatch(/(?:^|\/)plugins\/(?:\?\?@hytime\/dsh-thinking-effort\/client\.js&rev=|@hytime\/dsh-thinking-effort\/client\.js\?rev=)/)
+        const bundleResponse = await fetch(new URL(bundleUrl, web.url), {
+          headers,
+          signal: AbortSignal.timeout(10000),
+        })
+        expect(bundleResponse.status).toBe(200)
+        const servedCode = await bundleResponse.text()
+        expect(servedCode).toContain(clientCode)
+        expect(servedCode).toContain("id: '@hytime/dsh-thinking-effort'")
+
+        const namespaces = await readNamespaces()
+
+        // Invariant (a): `providers` is the entry's only volatile field, so the
+        // entry is listed and a path under `providers` is accepted. The host
+        // refuses a non-volatile path with "is not volatile", so the accepted
+        // write below is the causal half of this check.
+        const piAi = namespaces.find(({ ns }) => ns === 'llm-pi-ai')
+        expect(piAi, '0.1.7 must keep the llm-pi-ai providers form published').toBeDefined()
+        // A fresh profile has written nothing, so the resolved form is exactly
+        // the one volatile field. An absent key means the entry no longer
+        // publishes the form the fill reads, and the exact key set catches a
+        // form that started resolving fields the fill never asked for.
+        expect(Object.keys(piAi?.value ?? {})).toEqual(['providers'])
+        expect(entryFormFields(piAi?.schema)).toContain('providers')
+
+        // The published section itself: addressed by the Loader entry id, and
+        // covering exactly the fields the exported `Config` declares.
+        const own = namespaces.find(({ ns }) => ns === PLUGIN_ENTRY_ID)
+        expect(own, `0.1.7 must publish the ${PLUGIN_ENTRY_ID} settings section`).toBeDefined()
+        expect(entryFormFields(own?.schema))
+          .toEqual(['autoBackup', 'opencodeSession', 'profiles', 'subagentEffort'])
+        expect(own?.value).toMatchObject({
+          opencodeSession: expect.any(Object),
+          subagentEffort: expect.any(String),
+          profiles: expect.any(Object),
+          autoBackup: expect.any(Object),
+        })
+        expect(own?.revision).toEqual(expect.any(Number))
+
+        const markerPath = join(webHome, 'thinking-effort-loaded.json')
+        expect(existsSync(markerPath)).toBe(true)
+        const marker = JSON.parse(readFileSync(markerPath, 'utf8')) as { event?: string; name?: string }
+        expect(marker).toMatchObject({ event: 'apply', name: '@hytime/dsh-thinking-effort' })
+
+        const route = 'entry-config-compat'
+        const seeded = {
+          api: 'openai-completions',
+          baseURL: 'http://gateway.test/v1',
+          models: [{ id: 'entry-config-model-a', reasoningEfforts: { off: null, high: 'high' } }],
+        }
+        const seedResult = await liveResult('settings/mutate', {
+          ns: 'llm-pi-ai',
+          ops: [{ op: 'set', path: ['providers', route], value: seeded }],
+          expectedRevision: piAi?.revision,
+        })
+        expect(seedResult).toMatchObject({ ok: true, value: { ns: 'llm-pi-ai' } })
+
+        // Invariant (b), array half. The first minimal write is identical under
+        // either host because no part of the route is resolved yet; it only
+        // proves the write is accepted at all. The second write is the check: a
+        // host that derived its `current` from the resolved snapshot would carry
+        // the first write's route back already materialized (`models[].input`,
+        // `models[].compat`, `modelOverrides`, `headers`, `defaultContextWindow`
+        // …), so the user's document would gain every field the user never
+        // wrote.
+        const afterSeed = await readNamespaces()
+        const seededPiAi = afterSeed.find(({ ns }) => ns === 'llm-pi-ai')
+        const seededUser = seededPiAi?.user?.providers as Record<string, unknown> | undefined
+        expect(seededUser?.[route]).toEqual(seeded)
+
+        // Resolution materializes model fields the user never wrote. If it ever
+        // stopped, the second write below would silently become a no-op check
+        // rather than a regression alarm.
+        const resolvedModels = (seededPiAi?.value?.providers as Record<string, unknown> | undefined)
+          ?.[route] as { models?: readonly Record<string, unknown>[] } | undefined
+        expect(Object.keys(resolvedModels?.models?.[0] ?? {}).length)
+          .toBeGreaterThan(Object.keys(seeded.models[0] ?? {}).length)
+
+        const displayName = 'Entry Config Compliance'
+        const secondWrite = await liveResult('settings/mutate', {
+          ns: 'llm-pi-ai',
+          ops: [{ op: 'set', path: ['providers', route, 'displayName'], value: displayName }],
+          expectedRevision: seededPiAi?.revision,
+        })
+        expect(secondWrite).toMatchObject({ ok: true, value: { ns: 'llm-pi-ai' } })
+        const secondUser = (await readNamespaces())
+          .find(({ ns }) => ns === 'llm-pi-ai')?.user?.providers as Record<string, unknown> | undefined
+        expect(secondUser?.[route]).toEqual({ ...seeded, displayName })
+
+        // Invariant (b), defaults half: a minimal write into this plugin's own
+        // section must leave the user layer holding exactly the written path.
+        const ownBeforeWrite = afterSeed.find(({ ns }) => ns === PLUGIN_ENTRY_ID)
+        expect(ownBeforeWrite?.revision).toEqual(expect.any(Number))
+        const written = await liveResult('settings/mutate', {
+          ns: PLUGIN_ENTRY_ID,
+          ops: [{ op: 'set', path: ['subagentEffort'], value: 'high' }],
+          expectedRevision: ownBeforeWrite?.revision,
+        })
+        expect(written).toMatchObject({ ok: true, value: { ns: PLUGIN_ENTRY_ID } })
+
+        const ownAfterWrite = (await readNamespaces()).find(({ ns }) => ns === PLUGIN_ENTRY_ID)
+        expect(ownAfterWrite?.user).toEqual({ subagentEffort: 'high' })
+        // The resolved value still carries the schema defaults the user never
+        // wrote, which is what makes the assertion above non-vacuous.
+        expect(ownAfterWrite?.value).toMatchObject({
+          opencodeSession: expect.any(Object),
+          subagentEffort: 'high',
+          profiles: expect.any(Object),
+          autoBackup: expect.any(Object),
+        })
+
+        // Invariant (c): the provider-defaults fill writes on this model too.
+        // The route seeded above already declares `reasoningEfforts`, so the fill
+        // is a no-op on it; this route states none, which is the state the fill
+        // exists for. The write it performs is triggered by the change event the
+        // seed raises — a path the plugin can only take from outside that
+        // event's async context (see `fillScope` in `src/host/settings.ts`) — and
+        // its own write raises the event again, so the queued pass is the
+        // self-triggered re-run asserted below.
+        const fillRoute = 'entry-config-fill'
+        // A route the installed catalog does not describe needs its own
+        // `baseURL`, exactly as the seed above carries one.
+        const fillSeed = {
+          api: 'openai-completions',
+          baseURL: 'http://gateway.test/v1',
+          models: [{ id: 'entry-config-fill-model', name: 'Fill Model' }],
+        }
+        const beforeFill = await readNamespaces()
+        const fillSeedResult = await liveResult('settings/mutate', {
+          ns: 'llm-pi-ai',
+          ops: [{ op: 'set', path: ['providers', fillRoute], value: fillSeed }],
+          expectedRevision: beforeFill.find(({ ns }) => ns === 'llm-pi-ai')?.revision,
+        })
+        expect(fillSeedResult).toMatchObject({ ok: true, value: { ns: 'llm-pi-ai' } })
+
+        const fillUser = async (): Promise<Record<string, unknown> | undefined> => {
+          const llm = (await readNamespaces()).find(({ ns }) => ns === 'llm-pi-ai')
+          return (llm?.user?.providers as Record<string, unknown> | undefined)?.[fillRoute] as Record<string, unknown> | undefined
+        }
+
+        // The fill writes the default level set into the user's own layer and
+        // nothing else: the route keeps the fields the user declared, and no
+        // resolved-only field (`input`, `compat`, …) reaches the document. The
+        // route states no `reasoningEfforts`, which is the state the fill exists
+        // for, and `waitForFill` reads the write rather than the read that
+        // preceded it.
+        const filledRoute = await waitForFill(async () => {
+          const route = await fillUser()
+          const models = route?.['models']
+          return Array.isArray(models) && (models[0] as Record<string, unknown> | undefined)?.['reasoningEfforts'] !== undefined
+            ? route
+            : undefined
+        })
+        expect(filledRoute).toEqual({
+          ...fillSeed,
+          models: [{ ...fillSeed.models[0], reasoningEfforts: { off: null, high: 'high', max: 'max' } }],
+        })
+
+        // The self-triggered re-run: the fill's own write raises the event, the
+        // queued pass re-reads and finds nothing to do, so the section settles
+        // rather than being written a second time.
+        const settled = (await readNamespaces()).find(({ ns }) => ns === 'llm-pi-ai')?.revision
+        expect(settled).toEqual(expect.any(Number))
+        await new Promise<void>((resolveWait) => setTimeout(resolveWait, 2500))
+        expect((await readNamespaces()).find(({ ns }) => ns === 'llm-pi-ai')?.revision).toBe(settled)
+        expect(await fillUser()).toEqual(filledRoute)
+
+        // The RPC checks above prove this host *lists* the section; the browser
+        // is what proves the served Client resolves and renders it, which is
+        // the user-visible outcome of the entry-config model. Running the probe
+        // on this root as well as on the namespace representative costs one
+        // more Chromium launch in the opt-in workflow and closes the gap where
+        // 0.1.7 had no client-side coverage at all.
+        await assertSettingsDomProbe(cliRoot, web, `version=${version} bootRows=${JSON.stringify(bootRows)}`)
+      } finally {
+        await web.stop()
+      }
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+      rmSync(webHome, { recursive: true, force: true })
+      rmSync(packDestination, { recursive: true, force: true })
+    }
+  })
+})
