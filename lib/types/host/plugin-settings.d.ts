@@ -1,4 +1,5 @@
 import z from '@deepseek-ai/schemastery';
+import type { OpenCodeEffortSettings } from '../compat/opencode-effort.js';
 import type { OpenCodeSessionSettings } from '../compat/opencode-session.js';
 /**
  * One stored configuration snapshot, as it appears in the settings document.
@@ -14,7 +15,7 @@ export interface PluginStoredSnapshot {
     readonly sections?: Readonly<Record<string, unknown>>;
 }
 /** The namespace's resolved shape: an OpenCode session section plus the snapshot fields. */
-export interface PluginSettings extends OpenCodeSessionSettings {
+export interface PluginSettings extends OpenCodeSessionSettings, OpenCodeEffortSettings {
     /**
      * The subagent thinking effort the plugin applies when a request carries no
      * explicit `reasoningEffort`. Empty means "unset, follow the provider

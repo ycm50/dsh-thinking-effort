@@ -14,6 +14,11 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 新增 / Added
+
+- 新增 OpenCode 思考强度对齐（\`opencodeEffort\`）：插件读取 OpenCode 模型目录（models.dev）中每个模型声明的思考强度（\`reasoning_options\`），为被监视路由上你已列出的模型补齐或修正 \`llm-pi-ai\` 的 \`reasoningEfforts\`，并在设置页提供「按 OpenCode 对齐」一键写入与「OpenCode 未声明」逐档位标注。只声明 \`toggle\` 或 \`budget_tokens\` 的模型不猜测取值、只记日志；「关闭」档只在目录声明了 \`none\`（或 \`off\`）时出现；目录抓取失败保留上一份快照；开关关闭时该功能不读设置、不联网、不注册定时器。
+- Add the OpenCode thinking-strength alignment (\`opencodeEffort\`): the plugin reads each model's declared thinking controls (\`reasoning_options\`) from OpenCode's model catalog (models.dev), fills in or corrects the \`reasoningEfforts\` of the models a deployment listed on a watched route, and offers a one-click "Align to OpenCode" action plus per-level "OpenCode does not declare this" markers in the settings page. A model that only declares \`toggle\` or \`budget_tokens\` is logged and left alone rather than guessed at, the "off" rung only exists where the catalog declares \`none\` (or \`off\`), a failed refresh keeps the previous snapshot, and with the switch off the feature reads no settings, makes no request, and registers no timer.
+
 ## [0.4.0] - 2026-09-23
 
 ### 变更 / Changed

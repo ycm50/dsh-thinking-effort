@@ -2,6 +2,12 @@ import React from 'react'
 import { GATEWAY_COMPAT_FIELD_KEYS, type GatewayCompatFieldKey } from '../compat/gateway/fields.js'
 import { editableProviderCompatFields } from '../compat/gateway/validation.js'
 import { isOpenCodeSessionSectionId } from '../compat/opencode-session.js'
+import {
+  catalogOptionsFor,
+  effortsForReasoningOptions,
+  planOpenCodeEffort,
+} from '../compat/opencode-effort.js'
+import type { OpenCodeEffortCatalogSnapshot, ReasoningEffortMap } from '../compat/opencode-effort.js'
 import packageJson from '@hytime/dsh-thinking-effort/package.json' with { type: 'json' }
 import { DEFAULT_LEVELS, INPUT_MODALITIES, LEVEL_LABEL_KEYS, NS, OPENCODE_SESSION_NS, PRESETS, ALL_LEVELS, CONTEXT_1M } from './constants.js'
 import { inventoryFrom, modelCompatKey, modelGatewayCompatViewsFrom, providerGatewayCompatViewsFrom } from './model-inventory.js'
@@ -104,6 +110,56 @@ export interface SectionEditorProps {
 
 const initialState: EditorState = {
   loading: true, namespace: null, openCodeSessionReads: 0, openCodeSessionViews: {}, openCodeSessionDrafts: {}, openCodeSessionDirty: {}, openCodeSessionFound: false, openCodeSessionAvailable: false, inventory: [], providerViews: {}, providerDrafts: {}, providerDirty: {}, providerCompatDirty: {}, providerCompatExpanded: {}, modelCompatViews: {}, modelCompatDrafts: {}, modelCompatDirty: {}, modelCompatExpanded: {}, revision: 0, expanded: {}, expandedProviders: {}, drafts: {}, contextDrafts: {}, inputDrafts: {}, dirty: {}, busy: false, error: null, notice: null, query: '', nsFound: true, pluginSection: null, subagent: null, subagentDraft: 'default', subagentCustom: '', quickSettingsOpen: false,
+}
+
+function ownRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
+}
+
+/**
+ * The compact OpenCode catalog out of this plugin's own section. The Host
+ * writes it on every successful refresh; the Client only reads it.
+ */
+export function openCodeCatalogOf(section: SettingsNamespace | null): OpenCodeEffortCatalogSnapshot | undefined {
+  const effort = ownRecord(ownRecord(section?.value)?.opencodeEffort)
+  const catalog = ownRecord(effort?.catalog)
+  return catalog === undefined ? undefined : catalog as OpenCodeEffortCatalogSnapshot
+}
+
+/** How many model declarations a snapshot carries. */
+export function openCodeCatalogModelCount(catalog: OpenCodeEffortCatalogSnapshot | undefined): number {
+  return Object.values(catalog?.providers ?? {})
+    .reduce((total, models) => total + Object.keys(models).length, 0)
+}
+
+/** The levels OpenCode declares for one model, when the snapshot covers it. */
+export function openCodeLevelsOf(
+  catalog: OpenCodeEffortCatalogSnapshot | undefined,
+  route: string,
+  model: string,
+): ReasoningEffortMap | undefined {
+  const options = catalogOptionsFor(catalog, route, model)
+  return options === undefined ? undefined : effortsForReasoningOptions(options)
+}
+
+/**
+ * The inventory rows whose stored levels differ from what OpenCode declares.
+ * A row the snapshot does not cover, or one that already matches, is not a
+ * target — aligning it would rewrite the document for nothing.
+ */
+export function openCodeAlignments(
+  inventory: readonly InventoryItem[],
+  catalog: OpenCodeEffortCatalogSnapshot | undefined,
+): Array<{ readonly item: InventoryItem; readonly levels: ReasoningEffortMap }> {
+  const targets: Array<{ item: InventoryItem; levels: ReasoningEffortMap }> = []
+  for (const item of inventory) {
+    const options = catalogOptionsFor(catalog, item.route, item.model)
+    const plan = planOpenCodeEffort(options, item.levels ?? undefined)
+    if (plan.kind === 'fill' || plan.kind === 'replace') targets.push({ item, levels: plan.levels })
+  }
+  return targets
 }
 
 export type { OpenCodeSessionState } from './types.js'
@@ -522,6 +578,39 @@ export function SectionEditor({ settings, locale, t, palette = iosPalette(), tak
     })
   }
 
+  /**
+   * Write OpenCode's declared ladders onto every row that differs.
+   *
+   * The write goes through the same path the preset buttons use, so a row the
+   * Host already aligned is a no-op and a row the user edited by hand is
+   * brought back to the declaration — which is what "align" means here.
+   */
+  const applyOpenCodeAlignment = (): void => {
+    const targets = openCodeAlignments(state.inventory, openCodeCatalogOf(state.pluginSection))
+    if (targets.length === 0) {
+      setState((current) => ({ ...current, notice: t('openCodeAlignNoop'), error: null }))
+      return
+    }
+    runOps({
+      ns: NS,
+      revision: state.revision,
+      ops: setOps(state.inventory, targets.map((target): ModelUpdate => ({ item: target.item, levels: { ...target.levels } as ModelUpdate['levels'] }))),
+      successMessage: t('openCodeAlignDone', { count: targets.length }),
+      onSuccess: () => {
+        setState((current) => {
+          let dirty = current.dirty
+          const drafts = { ...current.drafts }
+          for (const target of targets) {
+            const key = keyOf(target.item)
+            if (drafts[key]) drafts[key] = draftFrom(target.levels)
+            dirty = removeDirtyFields(dirty, key, ['levels'])
+          }
+          return { ...current, drafts, dirty }
+        })
+      },
+    })
+  }
+
   const applySubagentEffort = (): void => {
     const value = state.subagentDraft === 'default' ? undefined : state.subagentDraft === 'custom' ? state.subagentCustom.trim() : state.subagentDraft
     if (state.subagentDraft !== 'default' && !value) { setState((current) => ({ ...current, notice: null, error: t('customEffortRequired') })); return }
@@ -619,6 +708,9 @@ export function SectionEditor({ settings, locale, t, palette = iosPalette(), tak
     setState((current) => { const draft = current.inputDrafts[key] ?? inputDraftFrom(item); const other = modality === 'text' ? 'image' : 'text'; if (!enabled && !draft[other]) return { ...current, notice: null, error: t('inputCapabilityMinimum') }; return { ...current, error: null, notice: null, dirty: { ...current.dirty, [key]: { ...current.dirty[key], input: true } }, inputDrafts: { ...current.inputDrafts, [key]: { ...draft, [modality]: enabled, touched: true } } } })
   }
 
+  const openCodeCatalog = openCodeCatalogOf(state.pluginSection)
+  const openCodePending = openCodeAlignments(state.inventory, openCodeCatalog).length
+  const openCodeModelCount = openCodeCatalogModelCount(openCodeCatalog)
   const query = state.query.trim().toLowerCase()
   const visible = query === '' ? state.inventory : state.inventory.filter((item) => item.model.toLowerCase().includes(query) || item.name.toLowerCase().includes(query))
   const routes = [...new Set(visible.map((item) => item.route))]
@@ -635,7 +727,7 @@ export function SectionEditor({ settings, locale, t, palette = iosPalette(), tak
     <ConfigBackupCard settings={settings} palette={palette} t={t} onApplied={load} />
     <OpenCodeFormatCard settings={settings} palette={palette} t={t} revision={state.openCodeSessionReads} namespace={state.pluginSection?.ns ?? OPENCODE_SESSION_NS} onApplied={load} />
     {state.nsFound === false ? <p style={{ fontSize: '12px', opacity: 0.75 }}>{t('noNamespace')}</p> : <div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', marginBottom: state.quickSettingsOpen ? '4px' : '6px' }}><ActionButton text={t('quickSettings')} onClick={() => setState((current) => ({ ...current, quickSettingsOpen: !current.quickSettingsOpen }))} disabled={state.busy} palette={palette} icon={state.quickSettingsOpen ? 'chevronUp' : 'sliders'} />{state.quickSettingsOpen ? <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', flexBasis: '100%', padding: '4px', border: `1px solid ${palette.border}`, borderRadius: '8px', backgroundColor: palette.field }}>{PRESETS.map((preset) => <ActionButton key={preset.key} text={t(preset.labelKey)} onClick={() => { setState((current) => ({ ...current, quickSettingsOpen: false })); applyPreset(preset.levels) }} disabled={state.busy} palette={palette} icon={preset.key === 'official' ? 'sparkles' : 'sliders'} />)}</div> : null}</div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', marginBottom: state.quickSettingsOpen ? '4px' : '6px' }}><ActionButton text={t('quickSettings')} onClick={() => setState((current) => ({ ...current, quickSettingsOpen: !current.quickSettingsOpen }))} disabled={state.busy} palette={palette} icon={state.quickSettingsOpen ? 'chevronUp' : 'sliders'} />{state.quickSettingsOpen ? <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', flexBasis: '100%', padding: '4px', border: `1px solid ${palette.border}`, borderRadius: '8px', backgroundColor: palette.field }}>{PRESETS.map((preset) => <ActionButton key={preset.key} text={t(preset.labelKey)} onClick={() => { setState((current) => ({ ...current, quickSettingsOpen: false })); applyPreset(preset.levels) }} disabled={state.busy} palette={palette} icon={preset.key === 'official' ? 'sparkles' : 'sliders'} />)}<ActionButton key="opencode-align" text={openCodePending === 0 ? t('openCodeAlignIdle') : t('openCodeAlignAll', { count: openCodePending })} onClick={() => { setState((current) => ({ ...current, quickSettingsOpen: false })); applyOpenCodeAlignment() }} disabled={state.busy || openCodePending === 0} palette={palette} icon="sparkles" /><span style={{ display: 'grid', gap: '1px', minWidth: 0, fontSize: '10px', lineHeight: '13px', color: palette.secondary }}>{openCodeCatalog === undefined ? t('openCodeCatalogMissing') : t('openCodeCatalogSummary', { count: openCodeModelCount, savedAt: openCodeCatalog.savedAt ?? '' })}</span></div> : null}</div>
       <div style={{ position: 'relative', marginBottom: '7px' }}><span style={{ position: 'absolute', left: '10px', top: '50%', transform: 'translateY(-50%)', color: palette.secondary, pointerEvents: 'none' }}><Icon name="search" size={15} /></span><input type="text" value={state.query} placeholder={t('searchPlaceholder')} onChange={(event) => { const value = event.currentTarget.value; setState((current) => ({ ...current, query: value })) }} style={{ boxSizing: 'border-box', width: '100%', height: '30px', padding: '0 10px 0 30px', border: `1px solid ${palette.border}`, borderRadius: '8px', fontSize: '13px', backgroundColor: palette.field, color: palette.text, outline: 'none', boxShadow: palette.shadow }} /></div>
       {state.loading ? <div style={{ fontSize: '12px', opacity: 0.7 }}>{t('loading')}</div> : visible.length === 0 ? <div style={{ fontSize: '12px', opacity: 0.7 }}>{state.inventory.length === 0 ? t('noModels') : t('noMatches')}</div> :
          routes.map((route) => { const providerModels = visible.filter((item) => item.route === route); const providerOpen = query !== '' || state.expandedProviders[route] === true; return <div key={route} style={{ marginBottom: '6px' }}><div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', alignItems: 'center', columnGap: '8px', minHeight: '32px', padding: '4px 6px', marginBottom: '4px', border: `1px solid ${palette.border}`, borderRadius: '8px', backgroundColor: palette.raised }}><span style={{ display: 'flex', alignItems: 'center', gap: '7px', minWidth: 0 }}><span style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: '22px', height: '22px', minWidth: '22px', border: `1px solid ${palette.border}`, borderRadius: '7px', color: palette.secondary, backgroundColor: palette.group }}><Icon name="layers" size={14} /></span><span style={{ display: 'grid', gap: '1px', minWidth: 0 }}><span style={{ color: palette.text, fontSize: '12px', fontWeight: 700, overflowWrap: 'anywhere' }}>{route}</span><span style={{ color: palette.accent, fontSize: '10px', lineHeight: '11px', fontWeight: 700 }}>{t('vendor')}</span></span></span><span style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11px', color: palette.secondary, whiteSpace: 'nowrap' }}><span>{t('modelCount', { count: providerModels.length })}</span>{query !== '' ? <span>{t('searchResults')}</span> : <ActionButton text="" onClick={() => toggleProvider(route)} palette={palette} tone="ghost" icon={providerOpen ? 'chevronUp' : 'chevronDown'} label={providerOpen ? t('collapseProvider') : t('expandProvider')} />}</span></div>{providerOpen && state.providerDrafts[route] ? <>
@@ -643,7 +735,7 @@ export function SectionEditor({ settings, locale, t, palette = iosPalette(), tak
                          compatView={compatAvailable ? state.modelCompatDrafts[key] : undefined}
                           compatExpanded={state.modelCompatExpanded[key] === true}
                           onToggleCompatExpanded={compatAvailable ? () => toggleModelCompatExpanded(key) : undefined}
-                          compatDirty={state.modelCompatDirty[key]} onCompatChange={compatAvailable ? (next) => patchModelCompat(item, next) : undefined} onSaveCompat={compatAvailable ? () => applyModelCompat(item) : undefined} openCodeSession={state.openCodeSessionDrafts[key]} openCodeSessionAvailable={openCodeSessionEditable} onOpenCodeSessionChange={(enabled) => patchOpenCodeSession(item, enabled)} /> }) : null}</div> })}
+                          compatDirty={state.modelCompatDirty[key]} onCompatChange={compatAvailable ? (next) => patchModelCompat(item, next) : undefined} onSaveCompat={compatAvailable ? () => applyModelCompat(item) : undefined} openCodeSession={state.openCodeSessionDrafts[key]} openCodeSessionAvailable={openCodeSessionEditable} onOpenCodeSessionChange={(enabled) => patchOpenCodeSession(item, enabled)} openCodeLevels={openCodeLevelsOf(openCodeCatalog, item.route, item.model)} /> }) : null}</div> })}
       {expandedCount > 0 ? <div style={{ fontSize: '12px', color: palette.secondary, margin: '4px 2px 0' }}>{t('expandedSettings', { count: expandedCount })}</div> : null}
     </div>}
     <span aria-label={t('versionLabel')} style={{ position: 'absolute', right: '12px', bottom: '8px', fontSize: '10px', lineHeight: '14px', opacity: 0.45, pointerEvents: 'none', userSelect: 'none' }}>v{PLUGIN_VERSION}</span>

@@ -182,6 +182,44 @@ Resolution order for one request: the route must match by `enabled` or an exact 
 
 Restart DSH after changing Host code or the package; the configuration itself is re-read on settings changes.
 
+## OpenCode thinking-strength alignment
+
+OpenCode's model catalog declares, per model, which thinking controls that model accepts (\`reasoning_options\`: an effort list, a thinking toggle, or a thinking token ceiling). This plugin mirrors that declaration onto \`llm-pi-ai\`: it fills in or corrects the \`reasoningEfforts\` of the models you already listed on a watched route, with a one-click alignment action and per-level "not declared" markers in the settings page.
+
+The configuration lives in this plugin's own section (the Loader entry \`thinking-effort\` on \`0.1.7\` and later, the \`dsh-thinking-effort\` namespace before that). The YAML below shows the namespace shape the pre-0.1.7 line reads:
+
+\`\`\`yaml
+dsh-thinking-effort:
+  opencodeEffort:
+    enabled: true            # Master switch, default false
+    align: true              # Whether the Host writes the declaration into llm-pi-ai
+    catalogUrl: https://models.dev/api.json
+    refreshHours: 24         # How long a fetched snapshot stays usable
+    providers:               # Watched routes; defaults to opencode and opencode-go
+      opencode-go: true
+      opencode: false
+    catalog:                 # The compact snapshot the Host writes after a fetch
+      savedAt: '2026-10-08T12:00:00.000Z'
+      source: https://models.dev/api.json
+      providers:
+        opencode-go:
+          deepseek-v4.1-flash:
+            - type: effort
+              values: [low, high, max]
+\`\`\`
+
+Behaviour:
+
+- **Value mapping**: \`none\` becomes DSH's "off" rung and sends the literal \`none\`; every other value (\`minimal\`/\`low\`/\`medium\`/\`high\`/\`xhigh\`/\`max\`) is sent as the level of the same name. A value the catalog does not describe is ignored rather than guessed at.
+- **A model that only declares \`toggle\` or \`budget_tokens\` gets no rungs**: the Host logs those models and leaves them exactly as they are, because OpenCode published no effort ladder for them.
+- **The "off" rung only exists when OpenCode declares \`none\` (or \`off\`)**: a ladder with no bottom rung is a model OpenCode does not offer "no thinking" for.
+- **Only models you listed are touched** (a \`models\` row or an existing \`modelOverrides\` entry) and only the \`reasoningEfforts\` field is written; a model whose rungs already match is left byte-for-byte alone, so a settled document produces no further writes.
+- **With \`enabled\` off nothing happens at all**: no settings read, no fetch, no timer.
+- **A failed refresh keeps the previous snapshot** and only logs a reason; alignment then continues against the old snapshot.
+- **When it starts**: on \`0.1.7\` and later the plugin reads the switch from the entry's own config at load, so an enabled deployment aligns at startup; the earlier namespace model has no entry config and starts at the first settings change to this section.
+
+The settings page's quick-settings panel gains an "Align to OpenCode (n models)" action (read-only once everything matches) and a catalog summary (declaration count and fetch time); expanding a model marks the rungs OpenCode does not declare for it.
+
 ## Gateway compatibility settings
 
 The provider global area in the Settings page edits the default `compat` values for every model under that provider. Expanding one model opens its single-model area. The four groups are collapsed by default.

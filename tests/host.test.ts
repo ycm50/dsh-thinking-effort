@@ -295,6 +295,16 @@ const openCodeSessionFormatDefaults = {
 
 const openCodeSessionUserAgentDefaults = { value: '', providers: {} }
 
+/** The OpenCode thinking-strength alignment defaults the section resolves to. */
+const openCodeEffortDefaults = {
+  enabled: false,
+  align: true,
+  catalogUrl: 'https://models.dev/api.json',
+  refreshHours: 24,
+  providers: {},
+  catalog: { savedAt: '', source: '', providers: {} },
+}
+
 describe('real Settings-backed OpenCode registration', () => {
   it('rejects non-boolean model values through the real Settings schema', async () => {
     const host = await bootRealOpenCodeHost()
@@ -307,6 +317,7 @@ describe('real Settings-backed OpenCode registration', () => {
       }])).rejects.toThrow()
       expect(host.ctx.settings.describe().find((entry) => entry.ns === OPENCODE_SESSION_NAMESPACE)?.value).toEqual({
         opencodeSession: { providers: {}, format: openCodeSessionFormatDefaults, userAgent: openCodeSessionUserAgentDefaults },
+        opencodeEffort: openCodeEffortDefaults,
         subagentEffort: '',
         profiles: {},
         autoBackup: snapshotDefaults,
@@ -341,6 +352,7 @@ describe('real Settings-backed OpenCode registration', () => {
           format: openCodeSessionFormatDefaults,
           userAgent: openCodeSessionUserAgentDefaults,
         },
+        opencodeEffort: openCodeEffortDefaults,
         subagentEffort: '',
         profiles: {},
         autoBackup: snapshotDefaults,

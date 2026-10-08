@@ -1,4 +1,6 @@
 import React from 'react'
+import { levelNamesOf } from '../../compat/opencode-effort.js'
+import type { ReasoningEffortMap } from '../../compat/opencode-effort.js'
 import { ALL_LEVELS, CONTEXT_1M, CONTEXT_MAX, CONTEXT_MIN, LEVEL_LABEL_KEYS } from '../constants.js'
 import { GATEWAY_COMPAT_FIELD_KEYS, type GatewayCompatFieldKey } from '../../compat/gateway/fields.js'
 import type { ContextDraft, DraftCell, InputDraft, InventoryItem, ModelCompatDirtyFields, ModelGatewayCompatUpdate, ModelGatewayCompatView, ReasoningDraft, Translation } from '../types.js'
@@ -31,9 +33,17 @@ export interface ModelEditorProps {
   readonly openCodeSession?: boolean
   readonly openCodeSessionAvailable?: boolean
   readonly onOpenCodeSessionChange?: (enabled: boolean) => void
+  /**
+   * The levels OpenCode's catalog declares for this model, when the plugin has
+   * a snapshot for its route. Rendering them turns the editor's seven rungs
+   * into "these, plus the ones OpenCode never declared" — the undeclared rows
+   * stay editable but are marked, because a hand-written model may legitimately
+   * need a level the catalog does not know about.
+   */
+  readonly openCodeLevels?: ReasoningEffortMap
 }
 
-export function ModelEditor({ item, draft, contextDraft, inputDraft, dirty, busy, palette, t, onLevelChange, onContextChange, onOneMillionChange, onInputChange, onSave, onRestoreReasoning, onRestoreCapability, compatView, onCompatChange, onSaveCompat, compatDirty, compatExpanded, onToggleCompatExpanded, openCodeSession, openCodeSessionAvailable = false, onOpenCodeSessionChange }: ModelEditorProps): React.ReactElement {
+export function ModelEditor({ item, draft, contextDraft, inputDraft, dirty, busy, palette, t, onLevelChange, onContextChange, onOneMillionChange, onInputChange, onSave, onRestoreReasoning, onRestoreCapability, compatView, onCompatChange, onSaveCompat, compatDirty, compatExpanded, onToggleCompatExpanded, openCodeSession, openCodeSessionAvailable = false, onOpenCodeSessionChange, openCodeLevels }: ModelEditorProps): React.ReactElement {
   const levelLabel = (level: typeof ALL_LEVELS[number]): string => t(LEVEL_LABEL_KEYS[level])
   const anyCompatDirty = compatDirty !== undefined && GATEWAY_COMPAT_FIELD_KEYS.some((key) => compatDirty[key] === true)
   const modelCompatControls = compatView !== undefined
@@ -68,12 +78,13 @@ export function ModelEditor({ item, draft, contextDraft, inputDraft, dirty, busy
       </div>
     </div>
     <div style={{ fontSize: '12px', fontWeight: 700, color: palette.secondary, margin: '0 0 4px 2px' }}>{t('reasoningLevels')}</div>
+    {openCodeLevels !== undefined ? <div data-scope="opencode-effort-levels" style={{ fontSize: '11px', lineHeight: '15px', color: palette.secondary, margin: '0 0 4px 2px' }}>{t('openCodeDeclaredLevels', { levels: levelNamesOf(openCodeLevels) })}</div> : null}
     <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', marginBottom: '2px', border: `0.5px solid ${palette.border}`, borderRadius: '6px', backgroundColor: palette.field, overflow: 'hidden' }}>
       {ALL_LEVELS.map((level, index) => {
         const cell = draft[level] ?? { on: false, wire: '' }
         return <div key={level} style={{ display: 'grid', gridTemplateColumns: '38px 72px minmax(0, 1fr)', alignItems: 'center', gap: '8px', minHeight: '36px', padding: '4px 8px', borderBottom: index < ALL_LEVELS.length - 1 ? `0.5px solid ${palette.divider}` : 'none', backgroundColor: cell.on ? palette.raised : 'transparent', fontSize: '12px' }}>
           <SwitchControl checked={cell.on} onChange={(enabled) => onLevelChange(level, { on: enabled })} disabled={busy} label={`${levelLabel(level)}${t('levelSuffix')}`} palette={palette} />
-          <span style={{ width: '58px', fontSize: '13px', fontWeight: 650 }}>{levelLabel(level)}</span>
+          <span style={{ width: '58px', fontSize: '13px', fontWeight: 650, color: openCodeLevels !== undefined && !Object.prototype.hasOwnProperty.call(openCodeLevels, level) ? palette.secondary : undefined, opacity: openCodeLevels !== undefined && !Object.prototype.hasOwnProperty.call(openCodeLevels, level) ? 0.7 : undefined }}>{levelLabel(level)}{openCodeLevels !== undefined && !Object.prototype.hasOwnProperty.call(openCodeLevels, level) ? <span data-scope="opencode-undeclared-level" style={{ display: 'block', fontSize: '9px', fontWeight: 500, lineHeight: '11px' }}>{t('openCodeUndeclaredLevel')}</span> : null}</span>
           {cell.on ? <input type="text" value={cell.wire} disabled={busy} placeholder={level === 'off' ? t('offPlaceholder') : t('wirePlaceholder')} onChange={(event) => onLevelChange(level, { wire: event.currentTarget.value })} style={{ boxSizing: 'border-box', width: '100%', minWidth: 0, height: '26px', padding: '0 8px', border: `1px solid ${palette.border}`, borderRadius: '8px', fontSize: '13px', backgroundColor: palette.group, color: palette.text, outline: 'none' }} /> : null}
         </div>
       })}

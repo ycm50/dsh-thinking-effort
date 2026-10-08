@@ -39,11 +39,21 @@ const formatDefaults = {
 
 const userAgentDefaults = { value: '', providers: {} }
 
+/** The OpenCode thinking-strength alignment defaults shared by both roots. */
+const openCodeEffortDefaults = {
+  enabled: false,
+  align: true,
+  catalogUrl: 'https://models.dev/api.json',
+  refreshHours: 24,
+  providers: {},
+  catalog: { savedAt: '', source: '', providers: {} },
+}
+
 describe('PLUGIN_SETTINGS_SCHEMA', () => {
   it('resolves a full section without altering it apart from owned field defaults', () => {
     const resolved = PLUGIN_SETTINGS_SCHEMA(section) as { opencodeSession?: Record<string, unknown> }
     const { opencodeSession, ...rest } = resolved
-    expect(rest).toEqual({ ...section, opencodeSession: undefined, subagentEffort: '' })
+    expect(rest).toEqual({ ...section, opencodeSession: undefined, opencodeEffort: openCodeEffortDefaults, subagentEffort: '' })
     expect(opencodeSession).toEqual({
       providers: { p: { models: { m: true } } },
       format: formatDefaults,
@@ -53,7 +63,8 @@ describe('PLUGIN_SETTINGS_SCHEMA', () => {
 
   it('materializes every owned field for an empty section so editors see a stable shape', () => {
     const resolved = PLUGIN_SETTINGS_SCHEMA({ opencodeSession: { providers: {} } }) as unknown as Record<string, unknown>
-    expect(Object.keys(resolved)).toEqual(['opencodeSession', 'subagentEffort', 'profiles', 'autoBackup'])
+    expect(Object.keys(resolved)).toEqual(['opencodeSession', 'opencodeEffort', 'subagentEffort', 'profiles', 'autoBackup'])
+    expect(resolved.opencodeEffort).toEqual(openCodeEffortDefaults)
     expect(resolved.subagentEffort).toBe('')
     expect(resolved.profiles).toEqual({})
     expect((resolved.opencodeSession as Record<string, unknown>).format).toEqual(formatDefaults)
@@ -115,6 +126,7 @@ function fieldPaths(schema: { toJSON(): unknown }): readonly string[] {
 
 const pluginSettingsDefaults = {
   opencodeSession: { providers: {}, format: formatDefaults, userAgent: userAgentDefaults },
+  opencodeEffort: openCodeEffortDefaults,
   subagentEffort: '',
   profiles: {},
   autoBackup: {
@@ -174,6 +186,6 @@ describe('Config', () => {
     const root = schemaNodeAtPath(envelope, [])
     expect(root?.type).toBe('object')
     expect(Object.keys(root?.dict ?? {}).sort())
-      .toEqual(['autoBackup', 'opencodeSession', 'profiles', 'subagentEffort'])
+      .toEqual(['autoBackup', 'opencodeEffort', 'opencodeSession', 'profiles', 'subagentEffort'])
   })
 })

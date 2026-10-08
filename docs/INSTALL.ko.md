@@ -182,6 +182,41 @@ dsh-thinking-effort:
 
 Host 또는 플러그인 패키지를 변경한 뒤에는 DSH를 재시작하세요. 설정 자체는 설정 변경 시 다시 읽힙니다.
 
+## OpenCode 사고 강도 정렬
+
+OpenCode 모델 카탈로그는 모델마다 받아들이는 사고 제어(\`reasoning_options\`: effort 값 목록, thinking 토글, thinking 토큰 상한)를 선언합니다. 이 플러그인은 그 선언을 \`llm-pi-ai\`에 반영해, 감시 대상 라우트에서 이미 나열한 모델의 \`reasoningEfforts\`를 채우거나 바로잡습니다. 설정 페이지에는 일괄 정렬 동작과 OpenCode가 선언하지 않은 단계 표시가 있습니다.
+
+설정은 이 플러그인 자체 섹션(\`0.1.7\` 이후는 Loader 엔트리 \`thinking-effort\`, \`0.1.0-rc.7\`~\`0.1.6\`은 \`dsh-thinking-effort\`)에 둡니다. 아래는 \`0.1.7\` 이전이 읽는 namespace 형태입니다:
+
+\`\`\`yaml
+dsh-thinking-effort:
+  opencodeEffort:
+    enabled: true            # 총 스위치(기본 false)
+    align: true              # 선언을 llm-pi-ai에 쓸지(기본 true)
+    catalogUrl: https://models.dev/api.json
+    refreshHours: 24         # 스냅샷 유효 기간
+    providers:               # 대상 라우트(생략 시 opencode와 opencode-go)
+      opencode-go: true
+      opencode: false
+    catalog:                 # 가져온 뒤 호스트가 기록하는 압축 스냅샷
+      savedAt: '2026-10-08T12:00:00.000Z'
+      source: https://models.dev/api.json
+      providers:
+        opencode-go:
+          deepseek-v4.1-flash:
+            - type: effort
+              values: [low, high, max]
+\`\`\`
+
+동작:
+
+- \`none\`은 DSH의 "끄기" 단계로 매핑하고 리터럴 \`none\`을 보냅니다. 나머지 값(\`minimal\`/\`low\`/\`medium\`/\`high\`/\`xhigh\`/\`max\`)은 같은 이름의 단계로 보냅니다. 카탈로그에 없는 값은 추측하지 않고 무시합니다.
+- \`toggle\` 또는 \`budget_tokens\`만 선언한 모델에는 단계를 만들지 않습니다(로그에 남기고 그대로 둡니다).
+- "끄기" 단계는 OpenCode가 \`none\`(또는 \`off\`)을 선언했을 때만 나타납니다.
+- 손대는 대상은 이미 나열한 모델(\`models\` 행 또는 기존 \`modelOverrides\` 항목)뿐이고 \`reasoningEfforts\`만 씁니다. 이미 일치하는 모델은 그대로 두므로 문서가 안정되면 더 이상 쓰지 않습니다.
+- \`enabled\`가 꺼져 있으면 완전히 조용합니다(설정 읽기·네트워크·타이머 없음).
+- 가져오기에 실패하면 이전 스냅샷을 유지하고 로그에 이유만 남깁니다.
+
 ## 게이트웨이 호환성 설정
 
 Settings의 provider 전역 영역에서는 해당 provider 아래 모든 모델의 `compat` 기본값을 수정합니다. 모델 하나를 펼치면 단일 모델 영역이 열립니다. 4개 그룹은 기본으로 접혀 있습니다.

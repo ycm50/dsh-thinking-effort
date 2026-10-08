@@ -1,4 +1,6 @@
 import z from '@deepseek-ai/schemastery'
+import { OPENCODE_EFFORT_CATALOG_URL } from '../compat/opencode-effort.js'
+import type { OpenCodeEffortSettings } from '../compat/opencode-effort.js'
 import type { OpenCodeSessionSettings } from '../compat/opencode-session.js'
 
 /**
@@ -91,7 +93,7 @@ export interface PluginStoredSnapshot {
 }
 
 /** The namespace's resolved shape: an OpenCode session section plus the snapshot fields. */
-export interface PluginSettings extends OpenCodeSessionSettings {
+export interface PluginSettings extends OpenCodeSessionSettings, OpenCodeEffortSettings {
   /**
    * The subagent thinking effort the plugin applies when a request carries no
    * explicit `reasoningEffort`. Empty means "unset, follow the provider
@@ -104,6 +106,55 @@ export interface PluginSettings extends OpenCodeSessionSettings {
 }
 
 /**
+ * One declared reasoning control, as the refresh stores it. The union is
+ * flattened for storage: `values` is empty for `toggle`, and `min`/`max` are
+ * zero for the shapes that do not carry them, so the stored snapshot survives a
+ * schema round-trip on every host version.
+ */
+const openCodeEffortOption = z.object({
+  type: z.string().default(''),
+  values: z.array(z.string()).default([]),
+  min: z.number().default(0),
+  max: z.number().default(0),
+})
+
+/** The compact catalog snapshot written by the plugin's own refresh. */
+const openCodeEffortCatalog = z.object({
+  savedAt: z.string().default(''),
+  source: z.string().default(''),
+  providers: z.dict(z.dict(z.array(openCodeEffortOption))).default({}),
+}).default({ savedAt: '', source: '', providers: {} })
+
+/**
+ * Defaults shared by the `opencodeEffort` section schema and the stored
+ * namespace shape, so the two literal copies stay in sync by construction.
+ */
+const OPENCODE_EFFORT_DEFAULTS = {
+  enabled: false,
+  align: true,
+  catalogUrl: OPENCODE_EFFORT_CATALOG_URL,
+  refreshHours: 24,
+  providers: {},
+  catalog: { savedAt: '', source: '', providers: {} },
+}
+
+/**
+ * The OpenCode thinking-strength alignment. OpenCode's catalog declares, per
+ * model, which thinking controls exist; enabling this section reads that
+ * declaration and mirrors it onto the watched routes' models, so a route the
+ * installed catalog does not describe still offers exactly the levels OpenCode
+ * accepts.
+ */
+const openCodeEffort = z.object({
+  enabled: z.boolean().default(false),
+  align: z.boolean().default(true),
+  catalogUrl: z.string().default(OPENCODE_EFFORT_CATALOG_URL),
+  refreshHours: z.number().default(24),
+  providers: z.dict(z.boolean()).default({}),
+  catalog: openCodeEffortCatalog,
+}).default({ ...OPENCODE_EFFORT_DEFAULTS })
+
+/**
  * The fields both schema roots expose: the namespace the older releases
  * register, and the Loader entry schema `Config` below. They are declared once
  * so a field can never reach one root without the other.
@@ -114,6 +165,7 @@ export interface PluginSettings extends OpenCodeSessionSettings {
  */
 const PLUGIN_SETTINGS_FIELDS = {
   opencodeSession: openCodeSession,
+  opencodeEffort: openCodeEffort,
   subagentEffort: z.string().default(''),
   profiles: z.dict(configSnapshot).default({}),
   autoBackup: configSnapshot,
@@ -129,6 +181,11 @@ const PLUGIN_SETTINGS_FIELDS = {
  */
 const PLUGIN_SETTINGS_DEFAULTS = {
   opencodeSession: { ...OPENCODE_SESSION_DEFAULTS },
+  opencodeEffort: {
+    ...OPENCODE_EFFORT_DEFAULTS,
+    providers: {},
+    catalog: { ...OPENCODE_EFFORT_DEFAULTS.catalog },
+  },
   subagentEffort: '',
   profiles: {},
   autoBackup: {

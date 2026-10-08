@@ -182,6 +182,41 @@ dsh-thinking-effort:
 
 Host またはプラグインパッケージを変更した後は DSH を再起動してください。設定自体は設定変更時に再読込されます。
 
+## OpenCode 思考強度の整合
+
+OpenCode のモデルカタログは、モデルごとに受け付ける思考制御（\`reasoning_options\`：effort の値一覧、thinking のオン/オフ、thinking トークン上限）を宣言しています。本プラグインはその宣言を \`llm-pi-ai\` に反映し、監視対象ルートで列挙済みのモデルの \`reasoningEfforts\` を補完・修正します。設定ページには一括整合の操作と、OpenCode が宣言していない段の表示があります。
+
+設定は本プラグイン自身のセクション（\`0.1.7\` 以降は Loader エントリー \`thinking-effort\`、\`0.1.0-rc.7\`〜\`0.1.6\` は \`dsh-thinking-effort\`）に置きます。以下は \`0.1.7\` より前が読む namespace 形式です：
+
+\`\`\`yaml
+dsh-thinking-effort:
+  opencodeEffort:
+    enabled: true            # 総スイッチ（既定 false）
+    align: true              # 宣言を llm-pi-ai に書き込むか（既定 true）
+    catalogUrl: https://models.dev/api.json
+    refreshHours: 24         # スナップショットの有効期間
+    providers:               # 対象ルート（省略時は opencode と opencode-go）
+      opencode-go: true
+      opencode: false
+    catalog:                 # 取得後にホストが書くコンパクトなスナップショット
+      savedAt: '2026-10-08T12:00:00.000Z'
+      source: https://models.dev/api.json
+      providers:
+        opencode-go:
+          deepseek-v4.1-flash:
+            - type: effort
+              values: [low, high, max]
+\`\`\`
+
+挙動：
+
+- \`none\` は DSH の「オフ」段に写像し、リテラル \`none\` を送ります。その他の値（\`minimal\`/\`low\`/\`medium\`/\`high\`/\`xhigh\`/\`max\`）は同名の段として送ります。カタログにない値は推測せず無視します。
+- \`toggle\` または \`budget_tokens\` しか宣言していないモデルには段を作りません（ログに記録し、そのままにします）。
+- 「オフ」段は OpenCode が \`none\`（または \`off\`）を宣言したときだけ現れます。
+- 書き換えるのは列挙済みのモデル（\`models\` の行、または既存の \`modelOverrides\` の項目）だけで、\`reasoningEfforts\` のみを書きます。既に一致するモデルはそのままなので、設定文書が安定すれば書き込みは発生しません。
+- \`enabled\` が切れているときは完全に沈黙します（設定読み取り・ネットワーク・タイマーなし）。
+- 取得に失敗した場合は前回のスナップショットを保持し、ログに理由だけを残します。
+
 ## ゲートウェイ互換設定
 
 Settings の provider グローバル領域では、その provider 配下のすべてのモデルの `compat` 既定値を編集します。モデルを 1 つ展開すると単一モデル領域が開きます。4 グループは既定で折りたたまれています。

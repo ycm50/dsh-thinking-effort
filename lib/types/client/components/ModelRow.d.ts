@@ -1,4 +1,5 @@
 import React from 'react';
+import type { ReasoningEffortMap } from '../../compat/opencode-effort.js';
 import { ALL_LEVELS } from '../constants.js';
 import type { ContextDraft, DraftCell, InputDraft, InventoryItem, ModelCompatDirtyFields, ModelGatewayCompatUpdate, ModelGatewayCompatView, ReasoningDraft, Translation } from '../types.js';
 import type { Palette } from '../theme.js';
@@ -29,5 +30,7 @@ export interface ModelRowProps {
     readonly openCodeSession?: boolean;
     readonly openCodeSessionAvailable?: boolean;
     readonly onOpenCodeSessionChange?: (enabled: boolean) => void;
+    /** OpenCode's declared levels for this model, handed to the expanded editor. */
+    readonly openCodeLevels?: ReasoningEffortMap;
 }
-export declare function ModelRow({ item, open, draft, contextDraft, inputDraft, dirty, busy, palette, t, onToggle, onLevelChange, onContextChange, onOneMillionChange, onInputChange, onSave, onRestoreReasoning, onRestoreCapability, compatView, onCompatChange, onSaveCompat, compatDirty, compatExpanded, onToggleCompatExpanded, openCodeSession, openCodeSessionAvailable, onOpenCodeSessionChange }: ModelRowProps): React.ReactElement;
+export declare function ModelRow({ item, open, draft, contextDraft, inputDraft, dirty, busy, palette, t, onToggle, onLevelChange, onContextChange, onOneMillionChange, onInputChange, onSave, onRestoreReasoning, onRestoreCapability, compatView, onCompatChange, onSaveCompat, compatDirty, compatExpanded, onToggleCompatExpanded, openCodeSession, openCodeSessionAvailable, onOpenCodeSessionChange, openCodeLevels }: ModelRowProps): React.ReactElement;

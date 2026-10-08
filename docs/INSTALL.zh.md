@@ -188,6 +188,44 @@ dsh-thinking-effort:
 
 修改 Host 或插件包后需重启 DSH；配置本身在设置变更时重新读取。
 
+## OpenCode 思考强度对齐
+
+OpenCode 的模型目录为每个模型声明它接受哪些思考强度（\`reasoning_options\`：effort 取值、thinking 开关、thinking token 上限）。本插件可以把这份声明镜像到 \`llm-pi-ai\`：为被监视路由上你已经列出的模型补齐或修正 \`reasoningEfforts\`，并在设置页提供一键对齐与「OpenCode 未声明」标注。
+
+配置在本插件自己的设置分区（\`0.1.7\` 及以后是 Loader 条目 \`thinking-effort\`；\`0.1.0-rc.7\` 至 \`0.1.6\` 是 \`dsh-thinking-effort\`）。下面的 YAML 展示 \`0.1.7\` 之前版本读取的 namespace 形态：
+
+\`\`\`yaml
+dsh-thinking-effort:
+  opencodeEffort:
+    enabled: true            # 总开关，默认 false
+    align: true              # Host 是否把声明写进 llm-pi-ai，默认 true
+    catalogUrl: https://models.dev/api.json
+    refreshHours: 24         # 快照多久算过期，默认 24 小时
+    providers:               # 参与对齐的路由；省略时默认 opencode 与 opencode-go
+      opencode-go: true
+      opencode: false
+    catalog:                 # Host 抓取成功后写入的紧凑快照，不需要手写
+      savedAt: '2026-10-08T12:00:00.000Z'
+      source: https://models.dev/api.json
+      providers:
+        opencode-go:
+          deepseek-v4.1-flash:
+            - type: effort
+              values: [low, high, max]
+\`\`\`
+
+行为：
+
+- **取值映射**：\`none\` 映射为 DSH 的「关闭」档并发送字面量 \`none\`；其余取值（\`minimal\`/\`low\`/\`medium\`/\`high\`/\`xhigh\`/\`max\`）按同名档位发送。目录里的未知取值被忽略，而不是猜一个。
+- **只声明 \`toggle\` 或 \`budget_tokens\` 的模型不产生档位**：插件在宿主日志里记下这些模型并保持原样，绝不编造 OpenCode 没有公布的取值。
+- **「关闭」档只在 OpenCode 声明了 \`none\`（或 \`off\`）时出现**：没有底部档位意味着该模型没有提供「关闭思考」这一档。
+- **只碰你已经列出的模型**（\`models\` 行或 \`modelOverrides\` 条目），且只写 \`reasoningEfforts\` 字段；档位已经一致的模型不会被改写，所以设置文档一旦稳定就不再产生写入。
+- **关闭 \`enabled\` 时这个功能完全静默**：不读设置、不联网、不注册定时器。
+- **目录抓取失败保留上一份快照**，只在宿主日志里写一条原因，随后仍按旧快照对齐。
+- **启动时机**：\`0.1.7\` 及以后插件在加载时从条目自身配置读出开关，启用后启动即对齐；更早的 namespace 模型没有条目配置，改为在第一次本分区设置变更时启动。
+
+设置页的「快速设置」里会出现「按 OpenCode 对齐（n 个模型）」（全部一致时为只读提示）与目录快照摘要（模型声明数量、抓取时间）；展开任一模型时，该模型 OpenCode 未声明的档位会被标注出来。
+
 ## 网关兼容设置
 
 设置页的 provider 全局区域用于修改该 provider 下全部模型的 `compat` 默认值。展开单个模型后进入单模型区域。4 组字段默认收起。
